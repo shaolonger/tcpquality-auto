@@ -107,10 +107,12 @@ load_config() {
   TG_BOT_TOKEN=""
   TG_CHAT_ID=""
   TG_THREAD_ID=""
+  SEND_FULL_LOG="N"
 
   if [[ -r "${CONF_FILE}" ]]; then
     # shellcheck disable=SC1090
     source "${CONF_FILE}"
+    SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
   fi
 }
 
@@ -122,6 +124,7 @@ save_config() {
     printf 'TG_BOT_TOKEN=%q\n' "${TG_BOT_TOKEN}"
     printf 'TG_CHAT_ID=%q\n' "${TG_CHAT_ID}"
     printf 'TG_THREAD_ID=%q\n' "${TG_THREAD_ID}"
+    printf 'SEND_FULL_LOG=%q\n' "${SEND_FULL_LOG}"
   } > "${CONF_FILE}"
 
   chmod 600 "${CONF_FILE}"
@@ -176,6 +179,7 @@ prompt_config() {
   local old_token="${TG_BOT_TOKEN:-}"
   local old_chat="${TG_CHAT_ID:-}"
   local old_thread="${TG_THREAD_ID:-}"
+  local old_send_full_log="${SEND_FULL_LOG:-N}"
 
   if [[ -n "${old_server}${old_tz}${old_time}${old_token}${old_chat}${old_thread}" ]]; then
     echo
@@ -256,6 +260,32 @@ prompt_config() {
   fi
 
   echo
+  local log_default_label="N"
+  [[ "${old_send_full_log^^}" == "Y" ]] && log_default_label="Y"
+  while true; do
+    read -r -p "是否通过 Telegram 发送完整测试日志？[y/N]（当前：${log_default_label}）: " input
+
+    if [[ -z "${input}" ]]; then
+      SEND_FULL_LOG="${old_send_full_log:-N}"
+      break
+    fi
+
+    case "${input}" in
+      y|Y|yes|YES|Yes)
+        SEND_FULL_LOG="Y"
+        break
+        ;;
+      n|N|no|NO|No)
+        SEND_FULL_LOG="N"
+        break
+        ;;
+      *)
+        warn "请输入 y 或 n；直接回车使用默认值。"
+        ;;
+    esac
+  done
+
+  echo
   info "验证 systemd 定时表达式..."
   local cal_expr="*-*-* ${RUN_TIME}:00 ${SCHEDULE_TZ}"
   systemd-analyze calendar "${cal_expr}" >/dev/null 2>&1 \
@@ -285,6 +315,7 @@ TCPQUALITY_URL="https://tcpquality.ibsgss.uk/run"
 
 # shellcheck disable=SC1090
 source "${CONF_FILE}"
+SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
 
 mkdir -p "${LOG_DIR}"
 chmod 700 "${LOG_DIR}"
@@ -387,8 +418,11 @@ ${report_url}"
 
   push_failed=0
   send_message "${msg}" || push_failed=1
-  sleep 2
-  send_document "${clean_log}" "✅ ${SERVER_NAME} · TcpQuality 完整测试日志" || push_failed=1
+
+  if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
+    sleep 2
+    send_document "${clean_log}" "✅ ${SERVER_NAME} · TcpQuality 完整测试日志" || push_failed=1
+  fi
 
   find "${LOG_DIR}" -type f -mtime +14 -delete 2>/dev/null || true
 
@@ -413,8 +447,11 @@ msg="❌ TcpQuality 测试失败
 原因：${reason}"
 
 send_message "${msg}" || true
-sleep 2
-send_document "${clean_log}" "❌ ${SERVER_NAME} · TcpQuality 错误日志" || true
+
+if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
+  sleep 2
+  send_document "${clean_log}" "❌ ${SERVER_NAME} · TcpQuality 错误日志" || true
+fi
 
 find "${LOG_DIR}" -type f -mtime +14 -delete 2>/dev/null || true
 exit "${exit_code}"
@@ -526,6 +563,11 @@ install_or_configure() {
   echo "服务器：${SERVER_NAME}"
   echo "计划：  每天 ${RUN_TIME}"
   echo "时区：  ${SCHEDULE_TZ}"
+  if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
+    echo "TG日志：发送完整测试日志"
+  else
+    echo "TG日志：仅发送摘要，不发送完整日志"
+  fi
   echo
   show_next_run false
 
@@ -656,6 +698,11 @@ show_status() {
   printf '%-18s %s\n' "Chat ID：" "${TG_CHAT_ID:-未知}"
   printf '%-18s %s\n' "Thread ID：" "${TG_THREAD_ID:-未设置}"
   printf '%-18s %s\n' "Bot Token：" "已配置（不显示）"
+  if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
+    printf '%-18s %s\n' "TG 完整日志：" "发送"
+  else
+    printf '%-18s %s\n' "TG 完整日志：" "不发送"
+  fi
   echo
   printf '%-18s %s\n' "开机自动启用：" "${timer_enabled}"
   printf '%-18s %s\n' "Timer 运行中：" "${timer_active}"
