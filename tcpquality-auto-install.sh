@@ -350,7 +350,7 @@ send_document() {
 start_time="$(now_local)"
 
 set +e
-timeout --signal=TERM --kill-after=30s 55m \
+TERM=xterm timeout --signal=TERM --kill-after=30s 55m \
   bash -c 'bash <(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 https://tcpquality.ibsgss.uk/run) --all' \
   >"${raw_log}" 2>&1
 exit_code=$?
@@ -432,6 +432,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+Environment=TERM=xterm
 ExecStart=${RUNNER}
 TimeoutStartSec=1h
 Nice=10
