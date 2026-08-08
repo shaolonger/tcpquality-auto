@@ -301,7 +301,7 @@ start_time="$(now_local)"
 
 set +e
 timeout --signal=TERM --kill-after=30s 55m \
-  bash -c 'bash <(curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 https://tcpquality.ibsgss.uk/run) --allow-speedtest -- --all' \
+  bash -c 'bash <(curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 https://tcpquality.ibsgss.uk/run) --all' \
   >"${raw_log}" 2>&1
 exit_code=$?
 set -e
