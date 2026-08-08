@@ -148,6 +148,12 @@ https://github.com/shaolonger/tcpquality-auto
 推荐在 VPS 上执行：
 
 ```bash
+bash <(curl -sL https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh)
+```
+
+也可以：
+
+```bash
 curl -fsSL \
   "https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh" \
   -o /tmp/tcpquality-auto-install.sh
