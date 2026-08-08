@@ -142,14 +142,14 @@ tzdata
 假设仓库地址最终为：
 
 ```text
-https://github.com/<YOUR_GITHUB_USERNAME>/tcpquality-auto
+https://github.com/shaolonger/tcpquality-auto
 ```
 
 推荐在 VPS 上执行：
 
 ```bash
 curl -fsSL \
-  "https://raw.githubusercontent.com/<YOUR_GITHUB_USERNAME>/tcpquality-auto/main/tcpquality-auto-install.sh" \
+  "https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh" \
   -o /tmp/tcpquality-auto-install.sh
 
 sudo bash /tmp/tcpquality-auto-install.sh
@@ -158,7 +158,7 @@ sudo bash /tmp/tcpquality-auto-install.sh
 也可以 Clone：
 
 ```bash
-git clone https://github.com/<YOUR_GITHUB_USERNAME>/tcpquality-auto.git
+git clone https://github.com/shaolonger/tcpquality-auto.git
 cd tcpquality-auto
 
 sudo bash tcpquality-auto-install.sh
@@ -1290,7 +1290,7 @@ Telegram 发送的是清理后的 `.log`。
 
 ```bash
 curl -fsSL \
-  "https://raw.githubusercontent.com/<YOUR_GITHUB_USERNAME>/tcpquality-auto/main/tcpquality-auto-install.sh" \
+  "https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh" \
   -o /tmp/tcpquality-auto-install.sh
 ```
 
