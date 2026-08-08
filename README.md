@@ -88,11 +88,7 @@ https://github.com/shaolonger/tcpquality-auto
 ## 推荐安装方式
 
 ```bash
-curl -fsSL \
-  "https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh" \
-  -o /tmp/tcpquality-auto-install.sh
-
-sudo bash /tmp/tcpquality-auto-install.sh
+bash <(curl -sL https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh)
 ```
 
 首次运行会进入中文管理菜单：
