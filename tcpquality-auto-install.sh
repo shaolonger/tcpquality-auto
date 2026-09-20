@@ -7,6 +7,7 @@ set -Eeuo pipefail
 # ============================================================
 
 APP_NAME="tcpquality-auto"
+APP_VERSION="2026.09.20.1"
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}"
 CONF_FILE="/etc/${APP_NAME}.conf"
 RUNNER="/usr/local/sbin/${APP_NAME}-run.sh"
@@ -306,7 +307,8 @@ set -Eeuo pipefail
 
 CONF_FILE="/etc/tcpquality-auto.conf"
 LOG_DIR="/var/log/tcpquality-auto"
-TCPQUALITY_URL="https://tcpquality.ibsgss.uk/run"
+TCPQUALITY_URL="${TCPQUALITY_URL:-https://tcpquality.ibsgss.uk/run}"
+TCPQUALITY_FALLBACK_URL="${TCPQUALITY_FALLBACK_URL:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh}"
 
 [[ -r "${CONF_FILE}" ]] || {
   echo "缺少配置：${CONF_FILE}" >&2
@@ -328,6 +330,8 @@ stamp="$(TZ="${SCHEDULE_TZ}" date '+%Y%m%d-%H%M%S')"
 raw_log="${LOG_DIR}/${stamp}.raw.log"
 clean_log="${LOG_DIR}/${stamp}.log"
 TG_API="https://api.telegram.org/bot${TG_BOT_TOKEN}"
+entry_script="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-entry.XXXXXX.sh")"
+trap 'rm -f "${entry_script}"' EXIT
 
 send_message() {
   local text="$1"
@@ -378,16 +382,97 @@ send_document() {
   curl "${args[@]}" >/dev/null
 }
 
+fetch_entry() {
+  local url="$1"
+  : > "${entry_script}"
+  echo "[tcpquality-auto] 下载 TcpQuality 入口：${url}" >> "${raw_log}"
+
+  if ! curl -fsSL \
+    --retry 3 \
+    --retry-all-errors \
+    --retry-delay 2 \
+    --connect-timeout 15 \
+    --max-time 120 \
+    "${url}" -o "${entry_script}" >> "${raw_log}" 2>&1; then
+    echo "[tcpquality-auto] 入口下载失败：${url}" >> "${raw_log}"
+    return 1
+  fi
+
+  if [[ ! -s "${entry_script}" ]]; then
+    echo "[tcpquality-auto] 入口下载异常：返回内容为空：${url}" >> "${raw_log}"
+    return 1
+  fi
+
+  if ! head -n 1 "${entry_script}" | grep -Eq '^#!.*(bash|sh)'; then
+    echo "[tcpquality-auto] 入口下载异常：返回内容不是可识别的 Shell 脚本：${url}" >> "${raw_log}"
+    return 1
+  fi
+
+  return 0
+}
+
+log_has() {
+  grep -Eqi -- "$1" "${clean_log}" 2>/dev/null
+}
+
+diagnose_failure() {
+  if log_has '\[tcpquality-auto\] 入口下载(失败|异常)'; then
+    echo "TcpQuality 入口脚本下载失败"
+  elif log_has 'Could not resolve host|Temporary failure in name resolution|Name or service not known|无法解析.*域名'; then
+    echo "网络异常：DNS / 域名解析失败"
+  elif log_has 'curl: \(28\)|Connection timed out|Operation timed out|Timeout was reached|timed out'; then
+    echo "网络异常：连接或下载超时"
+  elif log_has 'curl: \(7\)|Failed to connect|Connection refused|No route to host|Network is unreachable'; then
+    echo "网络异常：无法连接远端服务"
+  elif log_has 'rootfs SHA256 校验失败|rootfs 大小校验失败'; then
+    echo "TcpQuality rootfs 下载文件校验失败"
+  elif log_has 'rootfs 下载失败|创建 Debian rootfs 需要|Docker 创建 Debian 容器失败|Docker 导出 Debian rootfs 失败|无法获取 Alpine minirootfs 元数据'; then
+    echo "TcpQuality rootfs 获取或创建失败"
+  elif log_has 'SVG 报告上传失败|已跳过 SVG 报告上传'; then
+    echo "TcpQuality 在线报告上传失败"
+  elif log_has '\[X\].*(依赖|失败|无法|不支持|缺少)'; then
+    local detail
+    detail="$(grep -Ei '\[X\].*(依赖|失败|无法|不支持|缺少)' "${clean_log}" 2>/dev/null | tail -n 1 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' || true)"
+    if [[ -n "${detail}" ]]; then
+      echo "${detail}"
+    else
+      echo "TcpQuality 执行异常"
+    fi
+  else
+    echo "TcpQuality 执行异常"
+  fi
+}
+
 start_time="$(now_local)"
+: > "${raw_log}"
+
+entry_source="primary"
+entry_ready=0
+
+if fetch_entry "${TCPQUALITY_URL}"; then
+  entry_ready=1
+else
+  echo "[tcpquality-auto] 主入口不可用，尝试官方 GitHub Raw 备用入口。" >> "${raw_log}"
+  entry_source="fallback"
+  if fetch_entry "${TCPQUALITY_FALLBACK_URL}"; then
+    entry_ready=1
+  fi
+fi
 
 set +e
-TERM=xterm timeout --signal=TERM --kill-after=30s 55m \
-  bash -c 'bash <(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 https://tcpquality.ibsgss.uk/run) --all' \
-  >"${raw_log}" 2>&1
-exit_code=$?
+if [[ "${entry_ready}" -eq 1 ]]; then
+  echo "[tcpquality-auto] 入口脚本校验通过，开始执行 TcpQuality --all。" >> "${raw_log}"
+  TERM=xterm timeout --signal=TERM --kill-after=30s 55m \
+    bash "${entry_script}" --all \
+    >>"${raw_log}" 2>&1
+  exit_code=$?
+else
+  echo "[tcpquality-auto] 入口脚本主源和备用源均不可用。" >> "${raw_log}"
+  exit_code=90
+fi
 set -e
 
-# 去除常见 ANSI 控制字符，并把 CR 转成换行，便于阅读和 Telegram 发送。
+# 去除常见 ANSI 控制字符，并把 CR 转成换行，便于阅读、分析和 Telegram 发送。
 sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
   | tr '\r' '\n' \
   > "${clean_log}" \
@@ -395,66 +480,129 @@ sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
 
 end_time="$(now_local)"
 
+# 只接受 TcpQuality 真正的公开报告地址：/r/<report-id>。
+# 不再把 /run、/rootfs/releases/*.tar.xz 等资源 URL 误识别为结果链接。
 report_url="$(
-  grep -Eo 'https?://tcpquality\.ibsgss\.uk/[^[:space:]<>"'\'']+' "${clean_log}" 2>/dev/null \
-    | grep -Ev '/run($|[/?#])' \
+  grep -Eo 'https?://tcpquality\.ibsgss\.uk/r/[A-Za-z0-9_-]+' "${clean_log}" 2>/dev/null \
     | tail -n 1 \
     || true
 )"
 
-if [[ "${exit_code}" -eq 0 ]]; then
+report_upload_failed=0
+rootfs_fallback=0
+log_has 'SVG 报告上传失败|已跳过 SVG 报告上传' && report_upload_failed=1 || true
+log_has '预构建 rootfs 不可用，尝试下一来源|预构建 rootfs 下载失败，回退官方 Debian OCI|官方 Debian OCI rootfs 下载失败，尝试本地构建方式' && rootfs_fallback=1 || true
+
+reason="$(diagnose_failure)"
+status=""
+msg=""
+caption=""
+return_code="${exit_code}"
+
+if [[ "${exit_code}" -eq 0 && -n "${report_url}" ]]; then
+  status="success"
+  return_code=0
   msg="✅ TcpQuality 测试完成
 
 服务器：${SERVER_NAME}
 开始：${start_time}
-完成：${end_time}"
-
-  if [[ -n "${report_url}" ]]; then
-    msg="${msg}
+完成：${end_time}
 
 在线结果：
 ${report_url}"
+
+  notes=()
+  if [[ "${entry_source}" == "fallback" ]]; then
+    notes+=("主入口不可用，已自动切换官方 GitHub Raw 备用源")
+  fi
+  if [[ "${rootfs_fallback}" -eq 1 ]]; then
+    notes+=("rootfs 下载过程中发生过自动回退，但最终测试成功")
+  fi
+  if (( ${#notes[@]} > 0 )); then
+    note_text="$(IFS='；'; echo "${notes[*]}")"
+    msg="${msg}
+
+备注：${note_text}"
+  fi
+  caption="✅ ${SERVER_NAME} · TcpQuality 完整测试日志"
+
+elif [[ -n "${report_url}" ]]; then
+  # 已生成报告但进程最终非 0：保留报告，同时明确属于部分完成。
+  status="partial"
+  msg="⚠️ TcpQuality 测试部分完成
+
+服务器：${SERVER_NAME}
+开始：${start_time}
+完成：${end_time}
+原因：${reason}（退出码 ${exit_code}）
+
+在线结果：
+${report_url}"
+  caption="⚠️ ${SERVER_NAME} · TcpQuality 部分完成日志"
+
+elif [[ "${exit_code}" -eq 0 ]]; then
+  # TcpQuality 的报告上传函数失败时可能仍返回 0，因此“进程成功”不能等价于“完整成功”。
+  status="partial"
+  return_code=0
+
+  if [[ "${report_upload_failed}" -eq 1 ]]; then
+    reason="测试主体已执行结束，但在线报告上传失败"
+  else
+    reason="测试进程正常结束，但未检测到有效的 /r/ 在线报告链接"
   fi
 
-  push_failed=0
-  send_message "${msg}" || push_failed=1
+  msg="⚠️ TcpQuality 测试部分完成
 
-  if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
-    sleep 2
-    send_document "${clean_log}" "✅ ${SERVER_NAME} · TcpQuality 完整测试日志" || push_failed=1
-  fi
+服务器：${SERVER_NAME}
+开始：${start_time}
+完成：${end_time}
+原因：${reason}
 
-  find "${LOG_DIR}" -type f -mtime +14 -delete 2>/dev/null || true
+建议：查看本地测试日志确认具体阶段；不会再把 rootfs 下载地址误报为测试结果。"
+  caption="⚠️ ${SERVER_NAME} · TcpQuality 部分完成日志"
 
-  if [[ "${push_failed}" -ne 0 ]]; then
-    echo "测试成功，但 Telegram 推送失败。" >&2
-    exit 2
-  fi
+else
+  status="failure"
+  case "${exit_code}" in
+    90)      reason="TcpQuality 入口脚本主源和备用源均下载失败" ;;
+    124|137) reason="测试超时（55 分钟）" ;;
+    *)
+      if [[ "${reason}" == "TcpQuality 执行异常" ]]; then
+        reason="测试进程退出码 ${exit_code}"
+      fi
+      ;;
+  esac
 
-  exit 0
-fi
-
-case "${exit_code}" in
-  124|137) reason="测试超时（55 分钟）" ;;
-  *)       reason="测试进程退出码 ${exit_code}" ;;
-esac
-
-msg="❌ TcpQuality 测试失败
+  msg="❌ TcpQuality 测试失败
 
 服务器：${SERVER_NAME}
 开始：${start_time}
 完成：${end_time}
 原因：${reason}"
+  caption="❌ ${SERVER_NAME} · TcpQuality 错误日志"
+fi
 
-send_message "${msg}" || true
+push_failed=0
+send_message "${msg}" || push_failed=1
 
 if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
   sleep 2
-  send_document "${clean_log}" "❌ ${SERVER_NAME} · TcpQuality 错误日志" || true
+  send_document "${clean_log}" "${caption}" || push_failed=1
 fi
 
+# 保留最近 14 天运行日志。
 find "${LOG_DIR}" -type f -mtime +14 -delete 2>/dev/null || true
-exit "${exit_code}"
+
+if [[ "${push_failed}" -ne 0 ]]; then
+  echo "TcpQuality 状态：${status}；但 Telegram 推送失败。" >&2
+  # 测试本身成功/部分完成时，用 2 明确表示推送异常；
+  # 测试本身已失败时保留原测试退出码。
+  if [[ "${return_code}" -eq 0 ]]; then
+    exit 2
+  fi
+fi
+
+exit "${return_code}"
 RUNNER_EOF
 
   chmod 700 "${RUNNER}"
@@ -560,6 +708,7 @@ install_or_configure() {
   fi
 
   echo
+  echo "版本：  ${APP_VERSION}"
   echo "服务器：${SERVER_NAME}"
   echo "计划：  每天 ${RUN_TIME}"
   echo "时区：  ${SCHEDULE_TZ}"
@@ -646,7 +795,7 @@ run_test() {
   fi
 
   info "开始执行 TcpQuality 完整测试..."
-  echo "测试完成后会自动发送 Telegram 通知和完整日志。"
+  echo "测试完成后会自动发送 Telegram 摘要；是否发送完整日志以当前配置为准。"
   echo
 
   if systemctl start "${SERVICE_UNIT}"; then
@@ -692,6 +841,7 @@ show_status() {
   line
   echo -e "${C_BOLD} TcpQuality Auto 状态${C_RESET}"
   line
+  printf '%-18s %s\n' "版本：" "${APP_VERSION}"
   printf '%-18s %s\n' "服务器：" "${SERVER_NAME:-未知}"
   printf '%-18s %s\n' "执行时间：" "${RUN_TIME:-未知}"
   printf '%-18s %s\n' "任务时区：" "${SCHEDULE_TZ:-未知}"
@@ -858,7 +1008,7 @@ uninstall_app() {
 print_help() {
   cat <<EOF
 
-TcpQuality Auto
+TcpQuality Auto ${APP_VERSION}
 
 用法：
   sudo ${APP_NAME}
@@ -899,9 +1049,9 @@ menu_header() {
     load_config
     local timer_state="停止"
     systemctl is-active --quiet "${TIMER_UNIT}" 2>/dev/null && timer_state="运行"
-    echo "状态：已安装 | Timer：${timer_state} | 节点：${SERVER_NAME:-未知}"
+    echo "版本：${APP_VERSION} | 状态：已安装 | Timer：${timer_state} | 节点：${SERVER_NAME:-未知}"
   else
-    echo "状态：未安装"
+    echo "版本：${APP_VERSION} | 状态：未安装"
   fi
   line
   echo
