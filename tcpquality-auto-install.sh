@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # TcpQuality Auto portable bootstrap
-# Version: 2026.09.27.2
+# Version: 2026.09.27.3
 # Alpine: apk + Cronie/OpenRC compatibility backend
 # Debian/Ubuntu: keeps the existing systemd backend unchanged.
 
@@ -357,10 +357,107 @@ curl -fsSL \
   "${BASE_URL}" -o "${base_script}" \
   || die "无法下载基础脚本。"
 
+# Patch the downloaded inner installer itself so Alpine support does not
+# depend only on the outer compatibility bootstrap.
+python3 - "${base_script}" <<'PYINNER'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+c = path.read_text(encoding="utf-8")
+
+c = c.replace('APP_VERSION="2026.09.20.1"', 'APP_VERSION="2026.09.27.3"', 1)
+
+old_os = '''  if [[ "${ID:-}" != "debian" ]]; then
+    warn "当前系统为 ${PRETTY_NAME:-未知}。本脚本主要面向 Debian，将继续尝试。"
+  fi'''
+new_os = '''  case "${ID:-}" in
+    debian|ubuntu)
+      ;;
+    alpine)
+      info "当前系统：${PRETTY_NAME:-Alpine Linux}；使用 Alpine 兼容后端（apk + Cronie/OpenRC）。"
+      ;;
+    *)
+      warn "当前系统为 ${PRETTY_NAME:-未知}。将尝试兼容模式。"
+      ;;
+  esac'''
+if old_os in c:
+    c = c.replace(old_os, new_os, 1)
+
+old_install = '''install_or_configure() {
+  need_root "$@"
+  check_os
+  ensure_dependencies
+
+  local existed=0'''
+new_install = '''install_or_configure() {
+  need_root "$@"
+  check_os
+  ensure_dependencies
+
+  mkdir -p \
+    /usr/local/sbin \
+    /usr/local/libexec \
+    /etc/systemd/system \
+    /etc/cron.d \
+    "${LOG_DIR}"
+
+  chmod 0755 /usr/local/sbin /usr/local/libexec
+  chmod 0700 "${LOG_DIR}"
+
+  local existed=0'''
+if old_install not in c:
+    raise SystemExit("[FAIL] 无法定位 install_or_configure() 内部补丁锚点。")
+c = c.replace(old_install, new_install, 1)
+
+repls = [
+(
+'''write_runner() {
+  cat > "${RUNNER}" <<'RUNNER_EOF'
+''',
+'''write_runner() {
+  mkdir -p "$(dirname "${RUNNER}")"
+  cat > "${RUNNER}" <<'RUNNER_EOF'
+'''
+),
+(
+'''write_service() {
+  cat > "${SERVICE_FILE}" <<EOF
+''',
+'''write_service() {
+  mkdir -p "$(dirname "${SERVICE_FILE}")"
+  cat > "${SERVICE_FILE}" <<EOF
+'''
+),
+(
+'''write_timer() {
+  cat > "${TIMER_FILE}" <<EOF
+''',
+'''write_timer() {
+  mkdir -p "$(dirname "${TIMER_FILE}")"
+  cat > "${TIMER_FILE}" <<EOF
+'''
+),
+(
+'''install_manager_self() {
+  # 把当前脚本安装成全局管理命令：''',
+'''install_manager_self() {
+  mkdir -p "$(dirname "${MANAGER_PATH}")"
+  # 把当前脚本安装成全局管理命令：'''
+),
+]
+for old, new in repls:
+    if old not in c:
+        raise SystemExit("[FAIL] 内部补丁锚点缺失：" + old.splitlines()[0])
+    c = c.replace(old, new, 1)
+
+path.write_text(c, encoding="utf-8")
+PYINNER
+
 chmod 0755 "${base_script}"
 bash -n "${base_script}" || die "基础脚本语法检查失败。"
 
-# Run the current 2026.09.26.1 implementation as a child process. On Alpine
+# Run the patched implementation as a child process. On Alpine
 # the compatibility PATH makes its existing systemd-oriented manager use
 # Cronie/OpenRC transparently.
 set +e
