@@ -2,61 +2,141 @@
 set -Eeuo pipefail
 
 # TcpQuality Auto portable bootstrap
-# Version: 2026.09.27.4
-# Alpine: apk + Cronie/OpenRC compatibility backend
-# Debian/Ubuntu: keeps the existing systemd backend unchanged.
+# Version: 2026.09.27.5
+#
+# - Debian/Ubuntu: automatically installs missing bootstrap python3 dependency.
+# - Alpine: apk + Cronie/OpenRC compatibility backend.
+# - Keeps the validated 2026.09.26.1 report-upload recovery patch.
+#
+# The pinned hotfix below itself pins the complete installer at:
+# 9cfa6fcde0a134e2233ce90d4a479c92d251fe19
 
-BASE_COMMIT="9cfa6fcde0a134e2233ce90d4a479c92d251fe19"
-BASE_URL="https://raw.githubusercontent.com/shaolonger/tcpquality-auto/${BASE_COMMIT}/tcpquality-auto-install.sh"
-COMPAT_DIR="/usr/local/libexec/tcpquality-auto-compat"
-MANAGER="/usr/local/sbin/tcpquality-auto"
+HOTFIX_COMMIT="260c5ab03ea26f58d39acc2037006f273a5e0b07"
+HOTFIX_URL="https://raw.githubusercontent.com/shaolonger/tcpquality-auto/${HOTFIX_COMMIT}/tcpquality-auto-install.sh"
+TARGET_VERSION="2026.09.27.5"
 
-die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+die() {
+  printf '[FAIL] %s\n' "$*" >&2
+  exit 1
+}
 
-is_alpine() {
-  [[ -r /etc/os-release ]] || return 1
-  (
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    [[ "${ID:-}" == "alpine" ]]
-  )
+os_id() {
+  if [[ -r /etc/os-release ]]; then
+    (
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      printf '%s' "${ID:-}"
+    )
+  fi
+}
+
+run_root() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "该操作需要 root 权限；请使用 root 运行。"
+  fi
+}
+
+ensure_bootstrap_dependencies() {
+  local id
+  id="$(os_id)"
+
+  case "${id}" in
+    alpine)
+      printf '[INFO] 检测到 Alpine，安装 bootstrap / Cronie / OpenRC 依赖...\n'
+      run_root apk add --no-cache \
+        bash \
+        curl \
+        ca-certificates \
+        python3 \
+        coreutils \
+        findutils \
+        tzdata \
+        procps \
+        cronie \
+        cronie-openrc \
+        openrc \
+        tar \
+        xz \
+        zstd \
+        util-linux >/dev/null
+      ;;
+
+    debian|ubuntu)
+      local missing=0
+      command -v bash >/dev/null 2>&1 || missing=1
+      command -v curl >/dev/null 2>&1 || missing=1
+      command -v python3 >/dev/null 2>&1 || missing=1
+      [[ -d /usr/share/zoneinfo ]] || missing=1
+
+      if [[ "${missing}" -eq 1 ]]; then
+        printf '[INFO] Debian/Ubuntu 缺少 bootstrap 依赖，自动安装 python3 等组件...\n'
+        if [[ "${EUID}" -eq 0 ]]; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y bash curl ca-certificates python3 coreutils tzdata
+        elif command -v sudo >/dev/null 2>&1; then
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y bash curl ca-certificates python3 coreutils tzdata
+        else
+          die "缺少 python3，且当前不是 root；请使用 root 重新运行。"
+        fi
+      fi
+      ;;
+
+    *)
+      if ! command -v python3 >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+          printf '[INFO] 检测到 apt 系统，安装 python3 bootstrap 依赖...\n'
+          run_root apt-get update -y
+          run_root apt-get install -y python3 curl ca-certificates
+        elif command -v apk >/dev/null 2>&1; then
+          printf '[INFO] 检测到 apk 系统，安装 python3 bootstrap 依赖...\n'
+          run_root apk add --no-cache python3 curl ca-certificates bash
+        else
+          die "缺少 python3，且无法识别可用的软件包管理器。"
+        fi
+      fi
+      ;;
+  esac
+
+  command -v bash >/dev/null 2>&1 || die "bash 不可用。"
+  command -v curl >/dev/null 2>&1 || die "curl 不可用。"
+  command -v python3 >/dev/null 2>&1 || die "python3 不可用。"
 }
 
 setup_alpine_compat() {
-  printf '[INFO] 检测到 Alpine，安装 apk/Cronie/OpenRC 依赖...\n'
-  apk add --no-cache \
-    bash curl ca-certificates coreutils findutils tzdata python3 procps cronie openrc \
-    tar xz zstd util-linux >/dev/null
+  [[ "$(os_id)" == "alpine" ]] || return 0
 
-  # Minimal Alpine images may not contain Debian-style local/admin paths.
-  # The inherited manager writes the runner/manager under /usr/local/sbin and
-  # harmless compatibility marker units under /etc/systemd/system.
-  mkdir -p \
+  printf '[INFO] 配置 Alpine Cronie/OpenRC 兼容后端...\n'
+
+  run_root mkdir -p \
+    /usr/local/bin \
     /usr/local/sbin \
-    /usr/local/libexec \
     /etc/systemd/system \
     /etc/cron.d \
-    /var/log/tcpquality-auto \
-    "${COMPAT_DIR}"
+    /var/log/tcpquality-auto
 
-  chmod 0755 /usr/local/sbin /usr/local/libexec
-  chmod 0700 /var/log/tcpquality-auto
+  run_root chmod 0755 /usr/local/bin /usr/local/sbin
+  run_root chmod 0700 /var/log/tcpquality-auto
 
-  cat > "${COMPAT_DIR}/systemd-analyze" <<'EOF'
+  local tmp_compat
+  tmp_compat="$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-auto-alpine-compat.XXXXXX")"
+
+  cat > "${tmp_compat}/systemd-analyze" <<'EOF'
 #!/usr/bin/env bash
 # TcpQuality Auto Alpine compatibility shim.
 case "${1:-}" in
-  calendar)
-    # RUN_TIME and timezone are already validated by the manager itself.
-    exit 0
-    ;;
-  *)
-    exit 0
-    ;;
+  calendar) exit 0 ;;
+  *) exit 0 ;;
 esac
 EOF
 
-  cat > "${COMPAT_DIR}/systemctl" <<'EOF'
+  cat > "${tmp_compat}/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -u
 
@@ -78,6 +158,7 @@ load_conf() {
 
 write_cron() {
   load_conf
+
   local hh="${RUN_TIME%%:*}"
   local mm="${RUN_TIME##*:}"
 
@@ -90,12 +171,17 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CRON_TZ=${SCHEDULE_TZ}
 ${mm} ${hh} * * * root ${RUNNER} >> ${LOG_DIR}/cron.log 2>&1
 CRON
+
   chmod 0644 "${CRON_FILE}"
 }
 
 start_crond() {
-  command -v rc-update >/dev/null 2>&1 && rc-update add crond default >/dev/null 2>&1 || true
-  command -v rc-service >/dev/null 2>&1 && rc-service crond start >/dev/null 2>&1 || true
+  command -v rc-update >/dev/null 2>&1 \
+    && rc-update add crond default >/dev/null 2>&1 || true
+
+  command -v rc-service >/dev/null 2>&1 \
+    && rc-service crond start >/dev/null 2>&1 || true
+
   pgrep -x crond >/dev/null 2>&1 || crond >/dev/null 2>&1 || true
   pgrep -x crond >/dev/null 2>&1
 }
@@ -159,8 +245,7 @@ case "${action}" in
       write_cron
       start_crond
       exit $?
-    fi
-    if [[ "${unit}" == "${SERVICE}" ]]; then
+    elif [[ "${unit}" == "${SERVICE}" ]]; then
       pkill -TERM -f "${RUNNER}" >/dev/null 2>&1 || true
       sleep 1
       "${RUNNER}"
@@ -174,8 +259,7 @@ case "${action}" in
       write_cron
       start_crond
       exit $?
-    fi
-    if [[ "${unit}" == "${SERVICE}" ]]; then
+    elif [[ "${unit}" == "${SERVICE}" ]]; then
       service_active && exit 0
       "${RUNNER}"
       exit $?
@@ -187,8 +271,7 @@ case "${action}" in
     if [[ "${unit}" == "${TIMER}" ]]; then
       rm -f "${CRON_FILE}"
       exit 0
-    fi
-    if [[ "${unit}" == "${SERVICE}" ]]; then
+    elif [[ "${unit}" == "${SERVICE}" ]]; then
       pkill -TERM -f "${RUNNER}" >/dev/null 2>&1 || true
       exit 0
     fi
@@ -235,6 +318,7 @@ case "${action}" in
     load_conf
     echo "Alpine 定时后端：Cronie + OpenRC"
     echo "计划：每天 ${RUN_TIME} (${SCHEDULE_TZ})"
+
     if timer_active; then
       echo "状态：已启用，crond 正在运行"
     elif [[ -f "${CRON_FILE}" ]]; then
@@ -252,9 +336,10 @@ case "${action}" in
 esac
 EOF
 
-  cat > "${COMPAT_DIR}/journalctl" <<'EOF'
+  cat > "${tmp_compat}/journalctl" <<'EOF'
 #!/usr/bin/env bash
 set -u
+
 LOG_DIR="/var/log/tcpquality-auto"
 
 follow=0
@@ -275,8 +360,16 @@ if [[ -f "${LOG_DIR}/cron.log" ]]; then
 fi
 
 latest="$(
-  find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log' ! -name '*.raw.log' -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | head -n 1 | cut -d' ' -f2- || true
+  find "${LOG_DIR}" \
+    -maxdepth 1 \
+    -type f \
+    -name '*.log' \
+    ! -name '*.raw.log' \
+    -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | head -n 1 \
+    | cut -d' ' -f2- \
+    || true
 )"
 
 if [[ -n "${latest}" && -f "${latest}" ]]; then
@@ -287,186 +380,77 @@ fi
 EOF
 
   chmod 0755 \
-    "${COMPAT_DIR}/systemctl" \
-    "${COMPAT_DIR}/systemd-analyze" \
-    "${COMPAT_DIR}/journalctl"
+    "${tmp_compat}/systemctl" \
+    "${tmp_compat}/systemd-analyze" \
+    "${tmp_compat}/journalctl"
 
+  run_root install -m 0755 "${tmp_compat}/systemctl" /usr/local/bin/systemctl
+  run_root install -m 0755 "${tmp_compat}/systemd-analyze" /usr/local/bin/systemd-analyze
+  run_root install -m 0755 "${tmp_compat}/journalctl" /usr/local/bin/journalctl
 
-  for _dir in /usr/local/sbin /etc/systemd/system /var/log/tcpquality-auto; do
-    [[ -d "${_dir}" && -w "${_dir}" ]] || die "Alpine 安装目录不可写：${_dir}"
-  done
-  unset _dir
+  rm -rf "${tmp_compat}"
 
-  # Make the compatibility commands visible to the current installer run.
-  export PATH="${COMPAT_DIR}:${PATH}"
+  run_root rc-update add crond default >/dev/null 2>&1 || true
+  run_root rc-service crond start >/dev/null 2>&1 || true
 
-  # Start and enable Cronie now. The timer shim will write the actual job later.
-  rc-update add crond default >/dev/null 2>&1 || true
-  rc-service crond start >/dev/null 2>&1 || crond >/dev/null 2>&1 || true
+  if ! pgrep -x crond >/dev/null 2>&1; then
+    run_root crond >/dev/null 2>&1 || true
+  fi
+
+  pgrep -x crond >/dev/null 2>&1 \
+    || die "Alpine crond 未能启动。"
 }
 
-patch_installed_manager() {
-  [[ -f "${MANAGER}" ]] || return 0
+ensure_bootstrap_dependencies
+setup_alpine_compat
 
-  python3 - "${MANAGER}" "${COMPAT_DIR}" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-compat = sys.argv[2]
-text = path.read_text(encoding="utf-8")
-
-marker = "# TCPQUALITY_AUTO_ALPINE_COMPAT"
-if marker in text:
-    raise SystemExit(0)
-
-lines = text.splitlines(True)
-insert_at = 1 if lines and lines[0].startswith("#!") else 0
-block = (
-    "\n"
-    f"{marker}\n"
-    'if [[ -r /etc/os-release ]]; then\n'
-    '  _tq_id="$(. /etc/os-release; printf \'%s\' "${ID:-}")"\n'
-    f'  [[ "${{_tq_id}}" == "alpine" ]] && export PATH="{compat}:$PATH"\n'
-    '  unset _tq_id\n'
-    'fi\n\n'
-)
-lines.insert(insert_at, block)
-path.write_text("".join(lines), encoding="utf-8")
-PY
-
-  chmod 0755 "${MANAGER}"
-  bash -n "${MANAGER}" || die "安装后的管理器未通过 bash -n 检查。"
-}
-
-if is_alpine; then
-  setup_alpine_compat
-fi
-
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-auto-portable.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-auto-bootstrap.XXXXXX")"
 trap 'rm -rf "${tmp_dir}"' EXIT
-base_script="${tmp_dir}/tcpquality-auto-install.sh"
 
-printf '[INFO] 下载 TcpQuality Auto 基础版本 %s...\n' "${BASE_COMMIT:0:12}"
+hotfix_script="${tmp_dir}/tcpquality-auto-hotfix.sh"
+
+printf '[INFO] 下载报告恢复基础热修复 %s...\n' "${HOTFIX_COMMIT:0:12}"
 curl -fsSL \
   --retry 4 \
   --retry-all-errors \
   --retry-delay 2 \
   --connect-timeout 15 \
   --max-time 120 \
-  "${BASE_URL}" -o "${base_script}" \
-  || die "无法下载基础脚本。"
+  "${HOTFIX_URL}" -o "${hotfix_script}" \
+  || die "无法下载基础热修复：${HOTFIX_URL}"
 
-# Patch the downloaded inner installer itself so Alpine support does not
-# depend only on the outer compatibility bootstrap.
-python3 - "${base_script}" <<'PYINNER'
+[[ -s "${hotfix_script}" ]] || die "基础热修复脚本为空。"
+
+# Keep all report-recovery logic from the pinned hotfix, but expose this
+# portable build as the actual manager version.
+python3 - "${hotfix_script}" "${TARGET_VERSION}" <<'PY'
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
-c = path.read_text(encoding="utf-8")
+version = sys.argv[2]
+text = path.read_text(encoding="utf-8")
 
-c = c.replace('APP_VERSION="2026.09.20.1"', 'APP_VERSION="2026.09.27.4"', 1)
+old = 'PATCH_VERSION="2026.09.26.1"'
+new = f'PATCH_VERSION="{version}"'
 
-old_os = '''  if [[ "${ID:-}" != "debian" ]]; then
-    warn "当前系统为 ${PRETTY_NAME:-未知}。本脚本主要面向 Debian，将继续尝试。"
-  fi'''
-new_os = '''  case "${ID:-}" in
-    debian|ubuntu)
-      ;;
-    alpine)
-      info "当前系统：${PRETTY_NAME:-Alpine Linux}；使用 Alpine 兼容后端（apk + Cronie/OpenRC）。"
-      ;;
-    *)
-      warn "当前系统为 ${PRETTY_NAME:-未知}。将尝试兼容模式。"
-      ;;
-  esac'''
-if old_os in c:
-    c = c.replace(old_os, new_os, 1)
+if text.count(old) != 1:
+    raise SystemExit(
+        f"[FAIL] 基础热修复版本锚点异常：预期 1 处，实际 {text.count(old)} 处"
+    )
 
-old_install = '''install_or_configure() {
-  need_root "$@"
-  check_os
-  ensure_dependencies
+text = text.replace(old, new, 1)
+text = text.replace(
+    "# Version: 2026.09.26.1",
+    f"# Version: {version}",
+    1,
+)
 
-  local existed=0'''
-new_install = '''install_or_configure() {
-  need_root "$@"
-  check_os
-  ensure_dependencies
+path.write_text(text, encoding="utf-8")
+PY
 
-  mkdir -p \
-    /usr/local/sbin \
-    /usr/local/libexec \
-    /etc/systemd/system \
-    /etc/cron.d \
-    "${LOG_DIR}"
+chmod 0755 "${hotfix_script}"
+bash -n "${hotfix_script}" || die "生成后的热修复脚本未通过 bash -n 语法检查。"
 
-  chmod 0755 /usr/local/sbin /usr/local/libexec
-  chmod 0700 "${LOG_DIR}"
-
-  local existed=0'''
-if old_install not in c:
-    raise SystemExit("[FAIL] 无法定位 install_or_configure() 内部补丁锚点。")
-c = c.replace(old_install, new_install, 1)
-
-repls = [
-(
-'''write_runner() {
-  cat > "${RUNNER}" <<'RUNNER_EOF'
-''',
-'''write_runner() {
-  mkdir -p "$(dirname "${RUNNER}")"
-  cat > "${RUNNER}" <<'RUNNER_EOF'
-'''
-),
-(
-'''write_service() {
-  cat > "${SERVICE_FILE}" <<EOF
-''',
-'''write_service() {
-  mkdir -p "$(dirname "${SERVICE_FILE}")"
-  cat > "${SERVICE_FILE}" <<EOF
-'''
-),
-(
-'''write_timer() {
-  cat > "${TIMER_FILE}" <<EOF
-''',
-'''write_timer() {
-  mkdir -p "$(dirname "${TIMER_FILE}")"
-  cat > "${TIMER_FILE}" <<EOF
-'''
-),
-(
-'''install_manager_self() {
-  # 把当前脚本安装成全局管理命令：''',
-'''install_manager_self() {
-  mkdir -p "$(dirname "${MANAGER_PATH}")"
-  # 把当前脚本安装成全局管理命令：'''
-),
-]
-for old, new in repls:
-    if old not in c:
-        raise SystemExit("[FAIL] 内部补丁锚点缺失：" + old.splitlines()[0])
-    c = c.replace(old, new, 1)
-
-path.write_text(c, encoding="utf-8")
-PYINNER
-
-chmod 0755 "${base_script}"
-bash -n "${base_script}" || die "基础脚本语法检查失败。"
-
-# Run the patched implementation as a child process. On Alpine
-# the compatibility PATH makes its existing systemd-oriented manager use
-# Cronie/OpenRC transparently.
-set +e
-bash "${base_script}" "$@"
-rc=$?
-set -e
-
-if is_alpine; then
-  patch_installed_manager
-fi
-
-exit "${rc}"
+printf '[ OK ] Bootstrap 准备完成，目标版本：%s\n' "${TARGET_VERSION}"
+exec bash "${hotfix_script}" "$@"
