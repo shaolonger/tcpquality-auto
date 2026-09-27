@@ -2,11 +2,11 @@
 set -Eeuo pipefail
 
 # TcpQuality Auto portable bootstrap
-# Version: 2026.09.27.3
+# Version: 2026.09.27.4
 # Alpine: apk + Cronie/OpenRC compatibility backend
 # Debian/Ubuntu: keeps the existing systemd backend unchanged.
 
-BASE_COMMIT="260c5ab03ea26f58d39acc2037006f273a5e0b07"
+BASE_COMMIT="9cfa6fcde0a134e2233ce90d4a479c92d251fe19"
 BASE_URL="https://raw.githubusercontent.com/shaolonger/tcpquality-auto/${BASE_COMMIT}/tcpquality-auto-install.sh"
 COMPAT_DIR="/usr/local/libexec/tcpquality-auto-compat"
 MANAGER="/usr/local/sbin/tcpquality-auto"
@@ -366,7 +366,7 @@ import sys
 path = Path(sys.argv[1])
 c = path.read_text(encoding="utf-8")
 
-c = c.replace('APP_VERSION="2026.09.20.1"', 'APP_VERSION="2026.09.27.3"', 1)
+c = c.replace('APP_VERSION="2026.09.20.1"', 'APP_VERSION="2026.09.27.4"', 1)
 
 old_os = '''  if [[ "${ID:-}" != "debian" ]]; then
     warn "当前系统为 ${PRETTY_NAME:-未知}。本脚本主要面向 Debian，将继续尝试。"
