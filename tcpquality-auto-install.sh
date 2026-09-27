@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # TcpQuality Auto portable bootstrap
-# Version: 2026.09.27.1
+# Version: 2026.09.27.2
 # Alpine: apk + Cronie/OpenRC compatibility backend
 # Debian/Ubuntu: keeps the existing systemd backend unchanged.
 
@@ -28,7 +28,19 @@ setup_alpine_compat() {
     bash curl ca-certificates coreutils findutils tzdata python3 procps cronie openrc \
     tar xz zstd util-linux >/dev/null
 
-  mkdir -p "${COMPAT_DIR}"
+  # Minimal Alpine images may not contain Debian-style local/admin paths.
+  # The inherited manager writes the runner/manager under /usr/local/sbin and
+  # harmless compatibility marker units under /etc/systemd/system.
+  mkdir -p \
+    /usr/local/sbin \
+    /usr/local/libexec \
+    /etc/systemd/system \
+    /etc/cron.d \
+    /var/log/tcpquality-auto \
+    "${COMPAT_DIR}"
+
+  chmod 0755 /usr/local/sbin /usr/local/libexec
+  chmod 0700 /var/log/tcpquality-auto
 
   cat > "${COMPAT_DIR}/systemd-analyze" <<'EOF'
 #!/usr/bin/env bash
@@ -278,6 +290,12 @@ EOF
     "${COMPAT_DIR}/systemctl" \
     "${COMPAT_DIR}/systemd-analyze" \
     "${COMPAT_DIR}/journalctl"
+
+
+  for _dir in /usr/local/sbin /etc/systemd/system /var/log/tcpquality-auto; do
+    [[ -d "${_dir}" && -w "${_dir}" ]] || die "Alpine 安装目录不可写：${_dir}"
+  done
+  unset _dir
 
   # Make the compatibility commands visible to the current installer run.
   export PATH="${COMPAT_DIR}:${PATH}"
