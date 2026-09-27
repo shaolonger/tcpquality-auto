@@ -1,388 +1,87 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ============================================================
-# TcpQuality Auto
-# Debian VPS 定时 TcpQuality + Telegram 推送 + systemd 管理器
-# ============================================================
+# TcpQuality Auto hotfix installer
+# Version: 2026.09.26.1
+#
+# Replace tcpquality-auto-install.sh in shaolonger/tcpquality-auto with this file.
+# It pins the previous known-good installer, applies the report-upload recovery
+# patch deterministically, validates the patched result, then executes it.
 
-APP_NAME="tcpquality-auto"
-APP_VERSION="2026.09.20.1"
-MANAGER_PATH="/usr/local/sbin/${APP_NAME}"
-CONF_FILE="/etc/${APP_NAME}.conf"
-RUNNER="/usr/local/sbin/${APP_NAME}-run.sh"
-SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-TIMER_FILE="/etc/systemd/system/${APP_NAME}.timer"
-SERVICE_UNIT="${APP_NAME}.service"
-TIMER_UNIT="${APP_NAME}.timer"
-LOG_DIR="/var/log/${APP_NAME}"
+BASE_COMMIT="9cfa6fcde0a134e2233ce90d4a479c92d251fe19"
+BASE_URL="https://raw.githubusercontent.com/shaolonger/tcpquality-auto/${BASE_COMMIT}/tcpquality-auto-install.sh"
+PATCH_VERSION="2026.09.26.1"
 
-SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-auto-hotfix.XXXXXX")"
+base_script="${tmp_dir}/base.sh"
+patched_script="${tmp_dir}/tcpquality-auto-install.sh"
 
-if [[ -t 1 ]]; then
-  C_RESET='\033[0m'
-  C_GREEN='\033[0;32m'
-  C_YELLOW='\033[0;33m'
-  C_RED='\033[0;31m'
-  C_CYAN='\033[0;36m'
-  C_BOLD='\033[1m'
-else
-  C_RESET=''
-  C_GREEN=''
-  C_YELLOW=''
-  C_RED=''
-  C_CYAN=''
-  C_BOLD=''
-fi
+cleanup() { rm -rf "${tmp_dir}"; }
+trap cleanup EXIT
 
-info() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
-ok()   { echo -e "${C_GREEN}[ OK ]${C_RESET} $*"; }
-warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
-err()  { echo -e "${C_RED}[FAIL]${C_RESET} $*" >&2; }
-die()  { err "$*"; exit 1; }
+die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 
-line() {
-  printf '%s\n' "============================================================"
-}
+need_cmd curl
+need_cmd python3
+need_cmd bash
 
-pause_menu() {
-  echo
-  read -r -p "按 Enter 返回菜单..." _ || true
-}
+printf '[INFO] 下载 TcpQuality Auto 基础版本 %s...\n' "${BASE_COMMIT:0:12}"
+curl -fsSL \
+  --retry 4 \
+  --retry-all-errors \
+  --retry-delay 2 \
+  --connect-timeout 15 \
+  --max-time 120 \
+  "${BASE_URL}" -o "${base_script}" \
+  || die "无法下载基础安装脚本：${BASE_URL}"
 
-need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-      exec sudo -E bash "$SCRIPT_SELF" "$@"
-    fi
-    die "此操作需要 root 权限。请使用 root 运行，或安装 sudo。"
-  fi
-}
+[[ -s "${base_script}" ]] || die "基础安装脚本为空。"
 
-is_installed() {
-  [[ -f "${CONF_FILE}" && -f "${RUNNER}" && -f "${SERVICE_FILE}" && -f "${TIMER_FILE}" ]]
-}
+python3 - "${base_script}" "${patched_script}" "${PATCH_VERSION}" <<'PY'
+from pathlib import Path
+import sys
 
-require_installed() {
-  if ! is_installed; then
-    die "TcpQuality Auto 尚未安装。请先执行：sudo ${APP_NAME} install，或在菜单中选择“安装 / 更新”。"
-  fi
-}
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+version = sys.argv[3]
+c = src.read_text(encoding="utf-8")
 
-check_os() {
-  [[ -r /etc/os-release ]] || die "无法识别操作系统：缺少 /etc/os-release"
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  if [[ "${ID:-}" != "debian" ]]; then
-    warn "当前系统为 ${PRETTY_NAME:-未知}。本脚本主要面向 Debian，将继续尝试。"
-  fi
-}
+def replace_once(old: str, new: str, label: str):
+    global c
+    n = c.count(old)
+    if n != 1:
+        raise SystemExit(f"[FAIL] 补丁锚点异常：{label}，预期 1 处，实际 {n} 处")
+    c = c.replace(old, new, 1)
 
-ensure_dependencies() {
-  info "检查依赖..."
-  export DEBIAN_FRONTEND=noninteractive
+replace_once(
+    'APP_VERSION="2026.09.20.1"',
+    f'APP_VERSION="{version}"',
+    "APP_VERSION",
+)
 
-  local need_install=0
-  local cmd
-  for cmd in curl timeout systemctl systemd-analyze; do
-    command -v "${cmd}" >/dev/null 2>&1 || need_install=1
-  done
-  [[ -d /usr/share/zoneinfo ]] || need_install=1
+replace_once(
+    'TCPQUALITY_FALLBACK_URL="${TCPQUALITY_FALLBACK_URL:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh}"',
+    '''TCPQUALITY_FALLBACK_URL="${TCPQUALITY_FALLBACK_URL:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh}"
+REPORT_API="${TCPQUALITY_REPORT_API:-https://tcpquality.ibsgss.uk/generate}"
+REPORT_RECOVERY_ATTEMPTS="${TCPQUALITY_REPORT_RECOVERY_ATTEMPTS:-4}"
+REPORT_RECOVERY_CONNECT_TIMEOUT="${TCPQUALITY_REPORT_RECOVERY_CONNECT_TIMEOUT:-15}"
+REPORT_RECOVERY_MAX_TIME="${TCPQUALITY_REPORT_RECOVERY_MAX_TIME:-90}"''',
+    "runner constants",
+)
 
-  if [[ "${need_install}" -eq 1 ]]; then
-    info "安装必要依赖：curl、ca-certificates、coreutils、tzdata..."
-    apt-get update -y
-    apt-get install -y curl ca-certificates coreutils tzdata
-  fi
+replace_once(
+    '''clean_log="${LOG_DIR}/${stamp}.log"
+TG_API="https://api.telegram.org/bot${TG_BOT_TOKEN}"''',
+    '''clean_log="${LOG_DIR}/${stamp}.log"
+artifact_dir="${LOG_DIR}/${stamp}.artifacts"
+mkdir -p "${artifact_dir}"
+chmod 700 "${artifact_dir}"
+TG_API="https://api.telegram.org/bot${TG_BOT_TOKEN}"''',
+    "artifact directory",
+)
 
-  command -v curl >/dev/null 2>&1 || die "curl 不可用。"
-  command -v timeout >/dev/null 2>&1 || die "timeout 不可用。"
-  command -v systemctl >/dev/null 2>&1 || die "systemd / systemctl 不可用。"
-  command -v systemd-analyze >/dev/null 2>&1 || die "systemd-analyze 不可用。"
-}
-
-load_config() {
-  SERVER_NAME=""
-  SCHEDULE_TZ=""
-  RUN_TIME=""
-  TG_BOT_TOKEN=""
-  TG_CHAT_ID=""
-  TG_THREAD_ID=""
-  SEND_FULL_LOG="N"
-
-  if [[ -r "${CONF_FILE}" ]]; then
-    # shellcheck disable=SC1090
-    source "${CONF_FILE}"
-    SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
-  fi
-}
-
-save_config() {
-  {
-    printf 'SERVER_NAME=%q\n' "${SERVER_NAME}"
-    printf 'SCHEDULE_TZ=%q\n' "${SCHEDULE_TZ}"
-    printf 'RUN_TIME=%q\n' "${RUN_TIME}"
-    printf 'TG_BOT_TOKEN=%q\n' "${TG_BOT_TOKEN}"
-    printf 'TG_CHAT_ID=%q\n' "${TG_CHAT_ID}"
-    printf 'TG_THREAD_ID=%q\n' "${TG_THREAD_ID}"
-    printf 'SEND_FULL_LOG=%q\n' "${SEND_FULL_LOG}"
-  } > "${CONF_FILE}"
-
-  chmod 600 "${CONF_FILE}"
-}
-
-validate_timezone() {
-  local tz="$1"
-  if [[ "${tz}" == *".."* || "${tz}" == /* ]]; then
-    return 1
-  fi
-  [[ -e "/usr/share/zoneinfo/${tz}" ]]
-}
-
-validate_time() {
-  [[ "$1" =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]]
-}
-
-telegram_test() {
-  local api="https://api.telegram.org/bot${TG_BOT_TOKEN}"
-  local args=(
-    --silent
-    --show-error
-    --fail
-    --retry 3
-    --retry-delay 2
-    --connect-timeout 10
-    --max-time 30
-    -X POST
-    "${api}/sendMessage"
-    --data-urlencode "chat_id=${TG_CHAT_ID}"
-    --data-urlencode "text=✅ TcpQuality Auto Telegram 配置测试成功
-
-服务器：${SERVER_NAME}
-计划：每天 ${RUN_TIME}
-时区：${SCHEDULE_TZ}"
-    --data-urlencode "disable_web_page_preview=true"
-  )
-
-  if [[ -n "${TG_THREAD_ID:-}" ]]; then
-    args+=(--data-urlencode "message_thread_id=${TG_THREAD_ID}")
-  fi
-
-  curl "${args[@]}" >/dev/null
-}
-
-prompt_config() {
-  load_config
-
-  local old_server="${SERVER_NAME:-}"
-  local old_tz="${SCHEDULE_TZ:-}"
-  local old_time="${RUN_TIME:-}"
-  local old_token="${TG_BOT_TOKEN:-}"
-  local old_chat="${TG_CHAT_ID:-}"
-  local old_thread="${TG_THREAD_ID:-}"
-  local old_send_full_log="${SEND_FULL_LOG:-N}"
-
-  if [[ -n "${old_server}${old_tz}${old_time}${old_token}${old_chat}${old_thread}" ]]; then
-    echo
-    info "检测到已有配置。直接回车可保留原值。"
-  fi
-
-  local default_server="${old_server:-$(hostname)}"
-  local input=""
-
-  read -r -p "服务器名称 [${default_server}]: " input
-  SERVER_NAME="${input:-$default_server}"
-
-  local default_tz="${old_tz:-Asia/Shanghai}"
-  while true; do
-    read -r -p "定时任务时区 [${default_tz}]（如 Asia/Shanghai、America/Los_Angeles）: " input
-    SCHEDULE_TZ="${input:-$default_tz}"
-    if validate_timezone "${SCHEDULE_TZ}"; then
-      break
-    fi
-    warn "时区无效：${SCHEDULE_TZ}"
-    echo "可查看可用时区：timedatectl list-timezones | less"
-  done
-
-  local default_time="${old_time:-20:30}"
-  while true; do
-    read -r -p "每天执行时间 [${default_time}]（24 小时制 HH:MM）: " input
-    RUN_TIME="${input:-$default_time}"
-    if validate_time "${RUN_TIME}"; then
-      break
-    fi
-    warn "时间格式错误，例如：20:30、23:05。"
-  done
-
-  echo
-  echo "Telegram 参数："
-
-  if [[ -n "${old_token}" ]]; then
-    read -r -s -p "Bot Token [直接回车保留原 Token]: " input
-    echo
-    TG_BOT_TOKEN="${input:-$old_token}"
-  else
-    while true; do
-      read -r -s -p "Bot Token: " input
-      echo
-      if [[ -n "${input}" ]]; then
-        TG_BOT_TOKEN="${input}"
-        break
-      fi
-      warn "Bot Token 不能为空。"
-    done
-  fi
-
-  while true; do
-    if [[ -n "${old_chat}" ]]; then
-      read -r -p "Chat ID [${old_chat}]: " input
-      TG_CHAT_ID="${input:-$old_chat}"
-    else
-      read -r -p "Chat ID（私聊如 123456789；群组通常为 -100...）: " input
-      TG_CHAT_ID="${input}"
-    fi
-
-    if [[ -n "${TG_CHAT_ID}" ]]; then
-      break
-    fi
-    warn "Chat ID 不能为空。"
-  done
-
-  if [[ -n "${old_thread}" ]]; then
-    read -r -p "Topic Thread ID [${old_thread}]（输入 - 可清空）: " input
-    if [[ "${input}" == "-" ]]; then
-      TG_THREAD_ID=""
-    else
-      TG_THREAD_ID="${input:-$old_thread}"
-    fi
-  else
-    read -r -p "Topic Thread ID（可选，不使用直接回车）: " input
-    TG_THREAD_ID="${input}"
-  fi
-
-  echo
-  local log_default_label="N"
-  [[ "${old_send_full_log^^}" == "Y" ]] && log_default_label="Y"
-  while true; do
-    read -r -p "是否通过 Telegram 发送完整测试日志？[y/N]（当前：${log_default_label}）: " input
-
-    if [[ -z "${input}" ]]; then
-      SEND_FULL_LOG="${old_send_full_log:-N}"
-      break
-    fi
-
-    case "${input}" in
-      y|Y|yes|YES|Yes)
-        SEND_FULL_LOG="Y"
-        break
-        ;;
-      n|N|no|NO|No)
-        SEND_FULL_LOG="N"
-        break
-        ;;
-      *)
-        warn "请输入 y 或 n；直接回车使用默认值。"
-        ;;
-    esac
-  done
-
-  echo
-  info "验证 systemd 定时表达式..."
-  local cal_expr="*-*-* ${RUN_TIME}:00 ${SCHEDULE_TZ}"
-  systemd-analyze calendar "${cal_expr}" >/dev/null 2>&1 \
-    || die "当前 systemd 无法解析：${cal_expr}"
-  ok "定时表达式有效：${cal_expr}"
-
-  echo
-  info "验证 Telegram 并发送测试消息..."
-  telegram_test \
-    || die "Telegram 测试发送失败。请检查 Bot Token、Chat ID、Thread ID，以及 VPS 到 api.telegram.org 的连通性。"
-  ok "Telegram 测试消息已发送。"
-}
-
-write_runner() {
-  cat > "${RUNNER}" <<'RUNNER_EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-CONF_FILE="/etc/tcpquality-auto.conf"
-LOG_DIR="/var/log/tcpquality-auto"
-TCPQUALITY_URL="${TCPQUALITY_URL:-https://tcpquality.ibsgss.uk/run}"
-TCPQUALITY_FALLBACK_URL="${TCPQUALITY_FALLBACK_URL:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh}"
-
-[[ -r "${CONF_FILE}" ]] || {
-  echo "缺少配置：${CONF_FILE}" >&2
-  exit 1
-}
-
-# shellcheck disable=SC1090
-source "${CONF_FILE}"
-SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
-
-mkdir -p "${LOG_DIR}"
-chmod 700 "${LOG_DIR}"
-
-now_local() {
-  TZ="${SCHEDULE_TZ}" date '+%Y-%m-%d %H:%M:%S %Z'
-}
-
-stamp="$(TZ="${SCHEDULE_TZ}" date '+%Y%m%d-%H%M%S')"
-raw_log="${LOG_DIR}/${stamp}.raw.log"
-clean_log="${LOG_DIR}/${stamp}.log"
-TG_API="https://api.telegram.org/bot${TG_BOT_TOKEN}"
-entry_script="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-entry.XXXXXX.sh")"
-trap 'rm -f "${entry_script}"' EXIT
-
-send_message() {
-  local text="$1"
-  local args=(
-    --silent
-    --show-error
-    --fail
-    --retry 3
-    --retry-delay 2
-    --connect-timeout 10
-    --max-time 30
-    -X POST
-    "${TG_API}/sendMessage"
-    --data-urlencode "chat_id=${TG_CHAT_ID}"
-    --data-urlencode "text=${text}"
-    --data-urlencode "disable_web_page_preview=true"
-  )
-
-  if [[ -n "${TG_THREAD_ID:-}" ]]; then
-    args+=(--data-urlencode "message_thread_id=${TG_THREAD_ID}")
-  fi
-
-  curl "${args[@]}" >/dev/null
-}
-
-send_document() {
-  local file="$1"
-  local caption="$2"
-  local args=(
-    --silent
-    --show-error
-    --fail
-    --retry 3
-    --retry-delay 2
-    --connect-timeout 10
-    --max-time 120
-    -X POST
-    "${TG_API}/sendDocument"
-    -F "chat_id=${TG_CHAT_ID}"
-    -F "document=@${file}"
-    -F "caption=${caption}"
-  )
-
-  if [[ -n "${TG_THREAD_ID:-}" ]]; then
-    args+=(-F "message_thread_id=${TG_THREAD_ID}")
-  fi
-
-  curl "${args[@]}" >/dev/null
-}
-
-fetch_entry() {
+fetch_entry_block = r'''fetch_entry() {
   local url="$1"
   : > "${entry_script}"
   echo "[tcpquality-auto] 下载 TcpQuality 入口：${url}" >> "${raw_log}"
@@ -410,817 +109,217 @@ fetch_entry() {
 
   return 0
 }
+'''
 
-log_has() {
-  grep -Eqi -- "$1" "${clean_log}" 2>/dev/null
+recovery_extra = r'''
+extract_report_url_from_json() {
+  local file="$1"
+  sed -nE 's/.*"url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "${file}" 2>/dev/null \
+    | sed 's#\\/#/#g' \
+    | grep -E '^https?://tcpquality\.ibsgss\.uk/r/[A-Za-z0-9_-]+$' \
+    | head -n 1 \
+    || true
 }
 
-diagnose_failure() {
-  if log_has '\[tcpquality-auto\] 入口下载(失败|异常)'; then
-    echo "TcpQuality 入口脚本下载失败"
-  elif log_has 'Could not resolve host|Temporary failure in name resolution|Name or service not known|无法解析.*域名'; then
-    echo "网络异常：DNS / 域名解析失败"
-  elif log_has 'curl: \(28\)|Connection timed out|Operation timed out|Timeout was reached|timed out'; then
-    echo "网络异常：连接或下载超时"
-  elif log_has 'curl: \(7\)|Failed to connect|Connection refused|No route to host|Network is unreachable'; then
-    echo "网络异常：无法连接远端服务"
-  elif log_has 'rootfs SHA256 校验失败|rootfs 大小校验失败'; then
-    echo "TcpQuality rootfs 下载文件校验失败"
-  elif log_has 'rootfs 下载失败|创建 Debian rootfs 需要|Docker 创建 Debian 容器失败|Docker 导出 Debian rootfs 失败|无法获取 Alpine minirootfs 元数据'; then
-    echo "TcpQuality rootfs 获取或创建失败"
-  elif log_has 'SVG 报告上传失败|已跳过 SVG 报告上传'; then
-    echo "TcpQuality 在线报告上传失败"
-  elif log_has '\[X\].*(依赖|失败|无法|不支持|缺少)'; then
-    local detail
-    detail="$(grep -Ei '\[X\].*(依赖|失败|无法|不支持|缺少)' "${clean_log}" 2>/dev/null | tail -n 1 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' || true)"
-    if [[ -n "${detail}" ]]; then
-      echo "${detail}"
-    else
-      echo "TcpQuality 执行异常"
-    fi
-  else
-    echo "TcpQuality 执行异常"
-  fi
+find_current_csv() {
+  find "${artifact_dir}" -maxdepth 1 -type f -name 'zstatic_nping_*.csv' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | head -n 1 \
+    | cut -d' ' -f2- \
+    || true
 }
 
-start_time="$(now_local)"
-: > "${raw_log}"
+extract_report_time() {
+  grep -E '报告时间：' "${clean_log}" 2>/dev/null \
+    | tail -n 1 \
+    | sed -E 's/.*报告时间：[[:space:]]*//; s/[[:space:]]*$//' \
+    || true
+}
 
-entry_source="primary"
-entry_ready=0
+recover_report_upload() {
+  local csv="$1"
+  local response_file curl_err http_code recovered_url report_time
+  local family attempt sleep_s curl_rc
+  local -a retry_extra=()
+  local -a report_headers=()
 
-if fetch_entry "${TCPQUALITY_URL}"; then
-  entry_ready=1
-else
-  echo "[tcpquality-auto] 主入口不可用，尝试官方 GitHub Raw 备用入口。" >> "${raw_log}"
-  entry_source="fallback"
-  if fetch_entry "${TCPQUALITY_FALLBACK_URL}"; then
-    entry_ready=1
+  RECOVERED_REPORT_URL=""
+  [[ -s "${csv}" ]] || {
+    echo "[tcpquality-auto] 报告恢复上传跳过：未找到本次测试 CSV。" >> "${raw_log}"
+    return 1
+  }
+
+  report_time="$(extract_report_time)"
+  if [[ -n "${report_time}" ]]; then
+    report_headers+=(-H "X-Report-Time: ${report_time}")
   fi
-fi
 
-set +e
-if [[ "${entry_ready}" -eq 1 ]]; then
-  echo "[tcpquality-auto] 入口脚本校验通过，开始执行 TcpQuality --all。" >> "${raw_log}"
-  TERM=xterm timeout --signal=TERM --kill-after=30s 55m \
-    bash "${entry_script}" --all \
-    >>"${raw_log}" 2>&1
-  exit_code=$?
-else
-  echo "[tcpquality-auto] 入口脚本主源和备用源均不可用。" >> "${raw_log}"
-  exit_code=90
-fi
-set -e
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    retry_extra+=(--retry-all-errors)
+  fi
 
-# 去除常见 ANSI 控制字符，并把 CR 转成换行，便于阅读、分析和 Telegram 发送。
-sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
-  | tr '\r' '\n' \
-  > "${clean_log}" \
-  || cp -f "${raw_log}" "${clean_log}"
+  response_file="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-report-response.XXXXXX")"
+  curl_err="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-report-curl.XXXXXX")"
 
-end_time="$(now_local)"
+  # First preserve upstream behavior (IPv4). If that path is the problem,
+  # retry with the system-selected address family, which can use IPv6.
+  for family in ipv4 auto; do
+    for ((attempt=1; attempt<=REPORT_RECOVERY_ATTEMPTS; attempt++)); do
+      : > "${response_file}"
+      : > "${curl_err}"
+      http_code=""
+      curl_rc=0
 
-# 只接受 TcpQuality 真正的公开报告地址：/r/<report-id>。
-# 不再把 /run、/rootfs/releases/*.tar.xz 等资源 URL 误识别为结果链接。
-report_url="$(
+      local -a curl_args=(
+        --silent
+        --show-error
+        --connect-timeout "${REPORT_RECOVERY_CONNECT_TIMEOUT}"
+        --max-time "${REPORT_RECOVERY_MAX_TIME}"
+        --retry 2
+        --retry-delay 2
+        --retry-max-time 180
+        "${retry_extra[@]}"
+        -o "${response_file}"
+        -w '%{http_code}'
+        -H 'Content-Type: text/csv; charset=utf-8'
+        "${report_headers[@]}"
+        --data-binary "@${csv}"
+        "${REPORT_API}"
+      )
+
+      if [[ "${family}" == "ipv4" ]]; then
+        curl_args=(-4 "${curl_args[@]}")
+      fi
+
+      echo "[tcpquality-auto] 恢复上传：协议栈=${family}，第 ${attempt}/${REPORT_RECOVERY_ATTEMPTS} 次。" >> "${raw_log}"
+      http_code="$(curl "${curl_args[@]}" 2>"${curl_err}")" || curl_rc=$?
+
+      recovered_url="$(extract_report_url_from_json "${response_file}")"
+      if [[ "${curl_rc}" -eq 0 && "${http_code}" =~ ^2[0-9][0-9]$ && -n "${recovered_url}" ]]; then
+        RECOVERED_REPORT_URL="${recovered_url}"
+        echo "[tcpquality-auto] 恢复上传成功：HTTP ${http_code}，${RECOVERED_REPORT_URL}" >> "${raw_log}"
+        rm -f "${response_file}" "${curl_err}"
+        return 0
+      fi
+
+      {
+        echo "[tcpquality-auto] 恢复上传未成功：curl_rc=${curl_rc}，HTTP=${http_code:-none}"
+        if [[ -s "${curl_err}" ]]; then
+          echo "[tcpquality-auto] curl：$(tr '\n' ' ' < "${curl_err}" | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-400)"
+        fi
+        if [[ -s "${response_file}" ]]; then
+          echo "[tcpquality-auto] 响应：$(tr '\n' ' ' < "${response_file}" | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-400)"
+        fi
+      } >> "${raw_log}"
+
+      if (( attempt < REPORT_RECOVERY_ATTEMPTS )); then
+        sleep_s=$((5 * (1 << (attempt - 1))))
+        (( sleep_s > 40 )) && sleep_s=40
+        sleep "${sleep_s}"
+      fi
+    done
+  done
+
+  rm -f "${response_file}" "${curl_err}"
+  return 1
+}
+'''
+replace_once(fetch_entry_block, fetch_entry_block + recovery_extra, "report recovery functions")
+
+replace_once(
+    '  TERM=xterm timeout --signal=TERM --kill-after=30s 55m \\\n    bash "${entry_script}" --all \\\n    >>"${raw_log}" 2>&1',
+    '  TERM=xterm TCPQUALITY_OUTPUT_DIR="${artifact_dir}" \\\n    timeout --signal=TERM --kill-after=30s 55m \\\n    bash "${entry_script}" --all \\\n    >>"${raw_log}" 2>&1',
+    "TCPQUALITY_OUTPUT_DIR",
+)
+
+report_anchor = r'''report_url="$(
   grep -Eo 'https?://tcpquality\.ibsgss\.uk/r/[A-Za-z0-9_-]+' "${clean_log}" 2>/dev/null \
     | tail -n 1 \
     || true
 )"
 
 report_upload_failed=0
-rootfs_fallback=0
-log_has 'SVG 报告上传失败|已跳过 SVG 报告上传' && report_upload_failed=1 || true
-log_has '预构建 rootfs 不可用，尝试下一来源|预构建 rootfs 下载失败，回退官方 Debian OCI|官方 Debian OCI rootfs 下载失败，尝试本地构建方式' && rootfs_fallback=1 || true
+'''
 
-reason="$(diagnose_failure)"
-status=""
-msg=""
-caption=""
-return_code="${exit_code}"
+report_hook = r'''report_url="$(
+  grep -Eo 'https?://tcpquality\.ibsgss\.uk/r/[A-Za-z0-9_-]+' "${clean_log}" 2>/dev/null \
+    | tail -n 1 \
+    || true
+)"
 
-if [[ "${exit_code}" -eq 0 && -n "${report_url}" ]]; then
-  status="success"
-  return_code=0
-  msg="✅ TcpQuality 测试完成
+report_recovered=0
+report_recovery_attempted=0
+current_csv=""
 
-服务器：${SERVER_NAME}
-开始：${start_time}
-完成：${end_time}
+if [[ -z "${report_url}" && "${exit_code}" -eq 0 ]]; then
+  current_csv="$(find_current_csv)"
+  if [[ -n "${current_csv}" ]]; then
+    report_recovery_attempted=1
+    echo "[tcpquality-auto] 上游未返回有效 /r/ 链接，开始使用本次 CSV 在宿主机恢复上传。" >> "${raw_log}"
 
-在线结果：
-${report_url}"
+    if recover_report_upload "${current_csv}"; then
+      report_url="${RECOVERED_REPORT_URL}"
+      report_recovered=1
 
-  notes=()
-  if [[ "${entry_source}" == "fallback" ]]; then
-    notes+=("主入口不可用，已自动切换官方 GitHub Raw 备用源")
+      sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
+        | tr '\r' '\n' \
+        > "${clean_log}" \
+        || true
+    fi
+  else
+    echo "[tcpquality-auto] 上游未返回有效 /r/ 链接，且未找到本次测试持久化 CSV，无法恢复上传。" >> "${raw_log}"
   fi
-  if [[ "${rootfs_fallback}" -eq 1 ]]; then
+fi
+
+report_upload_failed=0
+'''
+replace_once(report_anchor, report_hook, "report recovery hook")
+
+replace_once(
+    '''  if [[ "${rootfs_fallback}" -eq 1 ]]; then
+    notes+=("rootfs 下载过程中发生过自动回退，但最终测试成功")
+  fi''',
+    '''  if [[ "${rootfs_fallback}" -eq 1 ]]; then
     notes+=("rootfs 下载过程中发生过自动回退，但最终测试成功")
   fi
-  if (( ${#notes[@]} > 0 )); then
-    note_text="$(IFS='；'; echo "${notes[*]}")"
-    msg="${msg}
+  if [[ "${report_recovered}" -eq 1 ]]; then
+    notes+=("上游首次报告上传失败，已使用本次 CSV 自动恢复上传")
+  fi''',
+    "success recovery note",
+)
 
-备注：${note_text}"
-  fi
-  caption="✅ ${SERVER_NAME} · TcpQuality 完整测试日志"
-
-elif [[ -n "${report_url}" ]]; then
-  # 已生成报告但进程最终非 0：保留报告，同时明确属于部分完成。
-  status="partial"
-  msg="⚠️ TcpQuality 测试部分完成
-
-服务器：${SERVER_NAME}
-开始：${start_time}
-完成：${end_time}
-原因：${reason}（退出码 ${exit_code}）
-
-在线结果：
-${report_url}"
-  caption="⚠️ ${SERVER_NAME} · TcpQuality 部分完成日志"
-
-elif [[ "${exit_code}" -eq 0 ]]; then
-  # TcpQuality 的报告上传函数失败时可能仍返回 0，因此“进程成功”不能等价于“完整成功”。
-  status="partial"
-  return_code=0
-
-  if [[ "${report_upload_failed}" -eq 1 ]]; then
+replace_once(
+    '''  if [[ "${report_upload_failed}" -eq 1 ]]; then
     reason="测试主体已执行结束，但在线报告上传失败"
   else
     reason="测试进程正常结束，但未检测到有效的 /r/ 在线报告链接"
-  fi
+  fi''',
+    '''  if [[ "${report_upload_failed}" -eq 1 && "${report_recovery_attempted}" -eq 1 ]]; then
+    reason="测试主体已执行结束；上游首次上传失败，宿主机恢复上传也未成功"
+  elif [[ "${report_upload_failed}" -eq 1 ]]; then
+    reason="测试主体已执行结束，但在线报告上传失败，且没有可用于恢复上传的本次 CSV"
+  elif [[ "${report_recovery_attempted}" -eq 1 ]]; then
+    reason="测试进程正常结束，但在线报告恢复上传未成功"
+  else
+    reason="测试进程正常结束，但未检测到有效的 /r/ 在线报告链接"
+  fi''',
+    "partial failure reason",
+)
 
-  msg="⚠️ TcpQuality 测试部分完成
-
-服务器：${SERVER_NAME}
-开始：${start_time}
-完成：${end_time}
-原因：${reason}
-
-建议：查看本地测试日志确认具体阶段；不会再把 rootfs 下载地址误报为测试结果。"
-  caption="⚠️ ${SERVER_NAME} · TcpQuality 部分完成日志"
-
-else
-  status="failure"
-  case "${exit_code}" in
-    90)      reason="TcpQuality 入口脚本主源和备用源均下载失败" ;;
-    124|137) reason="测试超时（55 分钟）" ;;
-    *)
-      if [[ "${reason}" == "TcpQuality 执行异常" ]]; then
-        reason="测试进程退出码 ${exit_code}"
-      fi
-      ;;
-  esac
-
-  msg="❌ TcpQuality 测试失败
-
-服务器：${SERVER_NAME}
-开始：${start_time}
-完成：${end_time}
-原因：${reason}"
-  caption="❌ ${SERVER_NAME} · TcpQuality 错误日志"
-fi
-
-push_failed=0
-send_message "${msg}" || push_failed=1
-
-if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
-  sleep 2
-  send_document "${clean_log}" "${caption}" || push_failed=1
-fi
-
-# 保留最近 14 天运行日志。
+replace_once(
+    '''# 保留最近 14 天运行日志。
+find "${LOG_DIR}" -type f -mtime +14 -delete 2>/dev/null || true''',
+    '''# 保留最近 14 天运行日志与本次测试产物。
 find "${LOG_DIR}" -type f -mtime +14 -delete 2>/dev/null || true
+find "${LOG_DIR}" -mindepth 1 -maxdepth 1 -type d -name '*.artifacts' -mtime +14 -exec rm -rf {} + 2>/dev/null || true''',
+    "artifact cleanup",
+)
 
-if [[ "${push_failed}" -ne 0 ]]; then
-  echo "TcpQuality 状态：${status}；但 Telegram 推送失败。" >&2
-  # 测试本身成功/部分完成时，用 2 明确表示推送异常；
-  # 测试本身已失败时保留原测试退出码。
-  if [[ "${return_code}" -eq 0 ]]; then
-    exit 2
-  fi
-fi
+dst.write_text(c, encoding="utf-8")
+PY
 
-exit "${return_code}"
-RUNNER_EOF
+chmod 0755 "${patched_script}"
+bash -n "${patched_script}" || die "补丁后的脚本未通过 bash -n 语法检查。"
 
-  chmod 700 "${RUNNER}"
-}
-
-write_service() {
-  cat > "${SERVICE_FILE}" <<EOF
-[Unit]
-Description=TcpQuality Auto Network Test
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-Environment=TERM=xterm
-ExecStart=${RUNNER}
-TimeoutStartSec=1h
-Nice=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_timer() {
-  cat > "${TIMER_FILE}" <<EOF
-[Unit]
-Description=Run TcpQuality Auto Daily (${RUN_TIME} ${SCHEDULE_TZ})
-
-[Timer]
-OnCalendar=*-*-* ${RUN_TIME}:00 ${SCHEDULE_TZ}
-Persistent=true
-AccuracySec=1s
-Unit=${SERVICE_UNIT}
-
-[Install]
-WantedBy=timers.target
-EOF
-}
-
-install_manager_self() {
-  # 把当前脚本安装成全局管理命令：
-  # sudo tcpquality-auto
-  if [[ -f "${SCRIPT_SELF}" ]]; then
-    local current_real target_real
-    current_real="$(readlink -f "${SCRIPT_SELF}" 2>/dev/null || true)"
-    target_real="$(readlink -f "${MANAGER_PATH}" 2>/dev/null || true)"
-
-    if [[ "${current_real}" != "${target_real}" ]]; then
-      install -m 0755 "${SCRIPT_SELF}" "${MANAGER_PATH}"
-    else
-      chmod 755 "${MANAGER_PATH}"
-    fi
-  fi
-}
-
-install_or_configure() {
-  need_root "$@"
-  check_os
-  ensure_dependencies
-
-  local existed=0
-  local was_enabled=0
-  local was_active=0
-
-  is_installed && existed=1
-  systemctl is-enabled --quiet "${TIMER_UNIT}" 2>/dev/null && was_enabled=1 || true
-  systemctl is-active --quiet "${TIMER_UNIT}" 2>/dev/null && was_active=1 || true
-
-  echo
-  line
-  echo -e "${C_BOLD} TcpQuality Auto 安装 / 配置${C_RESET}"
-  line
-
-  prompt_config
-
-  mkdir -p "${LOG_DIR}"
-  chmod 700 "${LOG_DIR}"
-
-  save_config
-  write_runner
-  write_service
-  write_timer
-  install_manager_self
-
-  systemctl daemon-reload
-
-  if [[ "${existed}" -eq 0 ]]; then
-    systemctl enable --now "${TIMER_UNIT}" >/dev/null
-    ok "首次安装完成，定时任务已启用。"
-  else
-    if [[ "${was_enabled}" -eq 1 ]]; then
-      systemctl enable "${TIMER_UNIT}" >/dev/null 2>&1 || true
-      systemctl restart "${TIMER_UNIT}"
-      ok "配置已更新，定时任务保持启用。"
-    elif [[ "${was_active}" -eq 1 ]]; then
-      systemctl restart "${TIMER_UNIT}"
-      ok "配置已更新，Timer 保持当前运行状态，但未设置开机启用。"
-    else
-      systemctl stop "${TIMER_UNIT}" >/dev/null 2>&1 || true
-      ok "配置已更新；检测到任务此前处于停止状态，因此继续保持停止。"
-    fi
-  fi
-
-  echo
-  echo "版本：  ${APP_VERSION}"
-  echo "服务器：${SERVER_NAME}"
-  echo "计划：  每天 ${RUN_TIME}"
-  echo "时区：  ${SCHEDULE_TZ}"
-  if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
-    echo "TG日志：发送完整测试日志"
-  else
-    echo "TG日志：仅发送摘要，不发送完整日志"
-  fi
-  echo
-  show_next_run false
-
-  echo
-  echo "以后可直接运行："
-  echo "  sudo ${APP_NAME}"
-  echo
-  echo "或使用命令："
-  echo "  sudo ${APP_NAME} status"
-  echo "  sudo ${APP_NAME} logs"
-  echo "  sudo ${APP_NAME} config"
-  echo "  sudo ${APP_NAME} run"
-  echo "  sudo ${APP_NAME} start"
-  echo "  sudo ${APP_NAME} stop"
-  echo "  sudo ${APP_NAME} restart"
-  echo "  sudo ${APP_NAME} uninstall"
-  echo
-
-  read -r -p "是否现在立即执行一次完整 TcpQuality 测试？[y/N]: " run_now
-  if [[ "${run_now}" =~ ^[Yy]$ ]]; then
-    run_test
-  fi
-}
-
-start_app() {
-  need_root "$@"
-  require_installed
-  systemctl enable --now "${TIMER_UNIT}"
-  ok "定时任务已启动并设置为开机自动启用。"
-  show_next_run false
-}
-
-stop_app() {
-  need_root "$@"
-  require_installed
-
-  systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
-
-  if systemctl is-active --quiet "${SERVICE_UNIT}"; then
-    info "检测到 TcpQuality 测试正在运行，正在停止..."
-    systemctl stop "${SERVICE_UNIT}" || true
-  fi
-
-  ok "定时任务已停止并禁用。配置和历史日志均已保留。"
-}
-
-restart_app() {
-  need_root "$@"
-  require_installed
-
-  if systemctl is-active --quiet "${SERVICE_UNIT}"; then
-    info "检测到测试正在运行，先停止当前测试..."
-    systemctl stop "${SERVICE_UNIT}" || true
-  fi
-
-  if systemctl is-enabled --quiet "${TIMER_UNIT}" 2>/dev/null; then
-    systemctl restart "${TIMER_UNIT}"
-    ok "定时任务已重启，并保持开机自动启用。"
-  else
-    systemctl restart "${TIMER_UNIT}"
-    warn "定时任务已重启，但当前仍是“未启用开机自启”状态。"
-    echo "如需恢复开机自动启用，请执行：sudo ${APP_NAME} start"
-  fi
-
-  show_next_run false
-}
-
-run_test() {
-  need_root "$@"
-  require_installed
-
-  if systemctl is-active --quiet "${SERVICE_UNIT}"; then
-    warn "TcpQuality 测试已经在运行，本次不会重复启动。"
-    systemctl status "${SERVICE_UNIT}" --no-pager || true
-    return 0
-  fi
-
-  info "开始执行 TcpQuality 完整测试..."
-  echo "测试完成后会自动发送 Telegram 摘要；是否发送完整日志以当前配置为准。"
-  echo
-
-  if systemctl start "${SERVICE_UNIT}"; then
-    ok "测试执行完成。"
-  else
-    warn "测试执行失败，请查看日志：sudo ${APP_NAME} logs"
-    return 1
-  fi
-}
-
-show_next_run() {
-  local heading="${1:-true}"
-  require_installed
-
-  if [[ "${heading}" == "true" ]]; then
-    echo
-    line
-    echo -e "${C_BOLD} 下一次执行时间${C_RESET}"
-    line
-  fi
-
-  if systemctl is-active --quiet "${TIMER_UNIT}" 2>/dev/null; then
-    systemctl list-timers "${TIMER_UNIT}" --all --no-pager || true
-  else
-    warn "Timer 当前未运行，因此没有活动的下一次执行计划。"
-    echo "恢复任务：sudo ${APP_NAME} start"
-  fi
-}
-
-show_status() {
-  require_installed
-  load_config
-
-  local timer_enabled="否"
-  local timer_active="否"
-  local service_active="否"
-
-  systemctl is-enabled --quiet "${TIMER_UNIT}" 2>/dev/null && timer_enabled="是" || true
-  systemctl is-active --quiet "${TIMER_UNIT}" 2>/dev/null && timer_active="是" || true
-  systemctl is-active --quiet "${SERVICE_UNIT}" 2>/dev/null && service_active="是" || true
-
-  echo
-  line
-  echo -e "${C_BOLD} TcpQuality Auto 状态${C_RESET}"
-  line
-  printf '%-18s %s\n' "版本：" "${APP_VERSION}"
-  printf '%-18s %s\n' "服务器：" "${SERVER_NAME:-未知}"
-  printf '%-18s %s\n' "执行时间：" "${RUN_TIME:-未知}"
-  printf '%-18s %s\n' "任务时区：" "${SCHEDULE_TZ:-未知}"
-  printf '%-18s %s\n' "Chat ID：" "${TG_CHAT_ID:-未知}"
-  printf '%-18s %s\n' "Thread ID：" "${TG_THREAD_ID:-未设置}"
-  printf '%-18s %s\n' "Bot Token：" "已配置（不显示）"
-  if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
-    printf '%-18s %s\n' "TG 完整日志：" "发送"
-  else
-    printf '%-18s %s\n' "TG 完整日志：" "不发送"
-  fi
-  echo
-  printf '%-18s %s\n' "开机自动启用：" "${timer_enabled}"
-  printf '%-18s %s\n' "Timer 运行中：" "${timer_active}"
-  printf '%-18s %s\n' "测试正在运行：" "${service_active}"
-
-  echo
-  echo "Service 最近状态："
-  systemctl show "${SERVICE_UNIT}" \
-    -p ActiveState \
-    -p SubState \
-    -p Result \
-    -p ExecMainStatus \
-    --no-pager 2>/dev/null || true
-
-  echo
-  show_next_run false
-}
-
-show_logs_cli() {
-  require_installed
-  echo
-  line
-  echo -e "${C_BOLD} TcpQuality Auto 最近运行日志${C_RESET}"
-  line
-  journalctl -u "${SERVICE_UNIT}" -n 150 --no-pager || true
-
-  local latest=""
-  latest="$(find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log' ! -name '*.raw.log' -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr \
-    | head -n 1 \
-    | cut -d' ' -f2- || true)"
-
-  if [[ -n "${latest}" && -f "${latest}" ]]; then
-    echo
-    line
-    echo "最新测试日志文件：${latest}"
-    line
-    tail -n 120 "${latest}" || true
-  fi
-}
-
-logs_menu() {
-  require_installed
-
-  while true; do
-    echo
-    line
-    echo -e "${C_BOLD} 日志管理${C_RESET}"
-    line
-    echo "1) 查看最近 systemd 运行日志"
-    echo "2) 实时跟踪 systemd 日志"
-    echo "3) 查看最新 TcpQuality 测试日志"
-    echo "4) 列出本地测试日志文件"
-    echo "5) 查看 Timer 日志"
-    echo "0) 返回上级菜单"
-    echo
-
-    read -r -p "请选择 [0-5]: " choice
-
-    case "${choice}" in
-      1)
-        journalctl -u "${SERVICE_UNIT}" -n 150 --no-pager || true
-        pause_menu
-        ;;
-      2)
-        echo "按 Ctrl+C 停止实时查看并返回。"
-        journalctl -u "${SERVICE_UNIT}" -f || true
-        pause_menu
-        ;;
-      3)
-        local latest=""
-        latest="$(find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log' ! -name '*.raw.log' -printf '%T@ %p\n' 2>/dev/null \
-          | sort -nr \
-          | head -n 1 \
-          | cut -d' ' -f2- || true)"
-        if [[ -n "${latest}" && -f "${latest}" ]]; then
-          echo
-          echo "文件：${latest}"
-          line
-          cat "${latest}"
-        else
-          warn "暂未找到测试日志。"
-        fi
-        pause_menu
-        ;;
-      4)
-        echo
-        if [[ -d "${LOG_DIR}" ]]; then
-          ls -lhAt "${LOG_DIR}" || true
-        else
-          warn "日志目录不存在：${LOG_DIR}"
-        fi
-        pause_menu
-        ;;
-      5)
-        journalctl -u "${TIMER_UNIT}" -n 100 --no-pager || true
-        pause_menu
-        ;;
-      0)
-        return 0
-        ;;
-      *)
-        warn "无效选项。"
-        ;;
-    esac
-  done
-}
-
-uninstall_app() {
-  need_root "$@"
-
-  echo
-  line
-  echo -e "${C_RED}${C_BOLD} 停止并卸载 TcpQuality Auto${C_RESET}"
-  line
-
-  if ! is_installed && [[ ! -e "${MANAGER_PATH}" ]]; then
-    warn "未检测到已安装的 TcpQuality Auto。"
-    return 0
-  fi
-
-  warn "该操作将停止定时任务，并删除配置、Runner 和 systemd 单元。"
-  echo "历史测试日志默认保留。"
-  echo
-  read -r -p "确认停止并卸载？[y/N]: " ans
-
-  if [[ ! "${ans}" =~ ^[Yy]$ ]]; then
-    echo "已取消。"
-    return 0
-  fi
-
-  systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
-  systemctl stop "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-
-  rm -f "${TIMER_FILE}" "${SERVICE_FILE}" "${RUNNER}" "${CONF_FILE}"
-  systemctl daemon-reload
-  systemctl reset-failed >/dev/null 2>&1 || true
-
-  read -r -p "是否同时删除历史日志 ${LOG_DIR}？[y/N]: " del_log
-  if [[ "${del_log}" =~ ^[Yy]$ ]]; then
-    rm -rf "${LOG_DIR}"
-    ok "历史日志已删除。"
-  else
-    ok "历史日志已保留：${LOG_DIR}"
-  fi
-
-  # 最后删除全局管理命令；当前进程仍可正常结束。
-  rm -f "${MANAGER_PATH}"
-
-  ok "TcpQuality Auto 已停止并卸载。"
-}
-
-print_help() {
-  cat <<EOF
-
-TcpQuality Auto ${APP_VERSION}
-
-用法：
-  sudo ${APP_NAME}
-  sudo ${APP_NAME} <command>
-
-命令：
-  install      安装 / 更新脚本并交互配置
-  config       修改现有配置
-  status       查看配置、Timer、Service 和下一次执行时间
-  logs         查看最近 systemd 日志和最新测试日志
-  run          立即执行一次 TcpQuality 测试
-  start        启动并启用定时任务
-  stop         停止并禁用定时任务（保留配置和日志）
-  restart      重启定时任务
-  next         查看下一次执行时间
-  uninstall    停止并卸载
-  help         显示帮助
-
-同样支持：
-  --install --config --status --logs --run --start --stop
-  --restart --next --uninstall --help
-
-安装后不带参数运行：
-  sudo ${APP_NAME}
-
-即可进入中文管理菜单。
-
-EOF
-}
-
-menu_header() {
-  clear 2>/dev/null || true
-  line
-  echo -e "${C_BOLD}      TcpQuality Auto 管理面板${C_RESET}"
-  line
-
-  if is_installed; then
-    load_config
-    local timer_state="停止"
-    systemctl is-active --quiet "${TIMER_UNIT}" 2>/dev/null && timer_state="运行"
-    echo "版本：${APP_VERSION} | 状态：已安装 | Timer：${timer_state} | 节点：${SERVER_NAME:-未知}"
-  else
-    echo "版本：${APP_VERSION} | 状态：未安装"
-  fi
-  line
-  echo
-}
-
-main_menu() {
-  need_root "$@"
-
-  while true; do
-    menu_header
-    echo "1) 安装 / 更新"
-    echo "2) 立即执行一次测试"
-    echo "3) 查看状态"
-    echo "4) 查看日志"
-    echo "5) 修改配置"
-    echo "6) 启动 / 恢复定时任务"
-    echo "7) 停止定时任务"
-    echo "8) 重启定时任务"
-    echo "9) 查看下一次执行时间"
-    echo "10) 停止并卸载"
-    echo "0) 退出"
-    echo
-
-    read -r -p "请选择 [0-10]: " choice
-
-    case "${choice}" in
-      1)
-        install_or_configure
-        pause_menu
-        ;;
-      2)
-        if is_installed; then
-          run_test || true
-        else
-          warn "尚未安装。"
-        fi
-        pause_menu
-        ;;
-      3)
-        if is_installed; then
-          show_status
-        else
-          warn "尚未安装。"
-        fi
-        pause_menu
-        ;;
-      4)
-        if is_installed; then
-          logs_menu
-        else
-          warn "尚未安装。"
-          pause_menu
-        fi
-        ;;
-      5)
-        if is_installed; then
-          install_or_configure
-        else
-          warn "尚未安装，请先选择 1 安装。"
-        fi
-        pause_menu
-        ;;
-      6)
-        if is_installed; then
-          start_app
-        else
-          warn "尚未安装。"
-        fi
-        pause_menu
-        ;;
-      7)
-        if is_installed; then
-          stop_app
-        else
-          warn "尚未安装。"
-        fi
-        pause_menu
-        ;;
-      8)
-        if is_installed; then
-          restart_app
-        else
-          warn "尚未安装。"
-        fi
-        pause_menu
-        ;;
-      9)
-        if is_installed; then
-          show_next_run
-        else
-          warn "尚未安装。"
-        fi
-        pause_menu
-        ;;
-      10)
-        uninstall_app
-        echo
-        echo "已退出。"
-        exit 0
-        ;;
-      0)
-        echo "已退出。"
-        exit 0
-        ;;
-      *)
-        warn "无效选项，请输入 0-10。"
-        sleep 1
-        ;;
-    esac
-  done
-}
-
-dispatch() {
-  local cmd="${1:-menu}"
-
-  case "${cmd}" in
-    menu)
-      main_menu
-      ;;
-    install|--install)
-      need_root "$@"
-      install_or_configure
-      ;;
-    config|--config)
-      need_root "$@"
-      require_installed
-      install_or_configure
-      ;;
-    status|--status)
-      require_installed
-      show_status
-      ;;
-    logs|log|--logs|--log)
-      require_installed
-      show_logs_cli
-      ;;
-    run|--run)
-      need_root "$@"
-      run_test
-      ;;
-    start|--start)
-      need_root "$@"
-      start_app
-      ;;
-    stop|--stop)
-      need_root "$@"
-      stop_app
-      ;;
-    restart|--restart)
-      need_root "$@"
-      restart_app
-      ;;
-    next|--next)
-      require_installed
-      show_next_run
-      ;;
-    uninstall|remove|--uninstall|--remove)
-      need_root "$@"
-      uninstall_app
-      ;;
-    help|-h|--help)
-      print_help
-      ;;
-    *)
-      err "未知命令：${cmd}"
-      print_help
-      exit 2
-      ;;
-  esac
-}
-
-dispatch "$@"
+printf '[ OK ] TcpQuality Auto %s 补丁生成完成，开始执行。\n' "${PATCH_VERSION}"
+exec bash "${patched_script}" "$@"
