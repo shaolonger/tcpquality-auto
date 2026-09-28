@@ -4,11 +4,11 @@ set -Eeuo pipefail
 # ============================================================
 # TcpQuality Auto
 # Pure Bash / Low-overhead / Debian+Alpine
-# Version: 2026.09.27.8
+# Version: 2026.09.27.10
 # ============================================================
 
 APP_NAME="tcpquality-auto"
-APP_VERSION="2026.09.27.8"
+APP_VERSION="2026.09.27.10"
 
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}"
 CONF_FILE="/etc/${APP_NAME}.conf"
@@ -23,6 +23,7 @@ CRON_FILE="/etc/cron.d/${APP_NAME}"
 
 LOG_DIR="/var/log/${APP_NAME}"
 
+SELF_SOURCE_URL="${TCPQUALITY_AUTO_SELF_URL:-https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh}"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 if [[ -t 1 ]]; then
@@ -54,13 +55,101 @@ pause_menu() {
   read -r -p "按 Enter 返回菜单..." _ || true
 }
 
-need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-      exec sudo -E bash "$SCRIPT_SELF" "$@"
-    fi
-    die "此操作需要 root 权限。请使用 root 运行，或安装 sudo。"
+self_fetch_url() {
+  local url="${SELF_SOURCE_URL}"
+
+  case "${url}" in
+    http://*|https://*)
+      if [[ "${url}" == *\?* ]]; then
+        printf '%s&v=%s' "${url}" "${APP_VERSION}"
+      else
+        printf '%s?v=%s' "${url}" "${APP_VERSION}"
+      fi
+      ;;
+    *)
+      printf '%s' "${url}"
+      ;;
+  esac
+}
+
+validate_self_source() {
+  local file="$1"
+  local found_version=""
+
+  [[ -s "${file}" ]] || return 1
+
+  found_version="$(
+    sed -nE 's/^APP_VERSION="([^"]+)".*/\1/p' "${file}" 2>/dev/null \
+      | head -n 1 \
+      || true
+  )"
+
+  [[ "${found_version}" == "${APP_VERSION}" ]] || return 2
+  bash -n "${file}" >/dev/null 2>&1 || return 3
+  return 0
+}
+
+fetch_self_copy() {
+  local destination="$1"
+  local url
+  url="$(self_fetch_url)"
+
+  if ! curl -fsSL \
+    --retry 4 \
+    --retry-delay 2 \
+    --connect-timeout 15 \
+    --max-time 120 \
+    "${url}" \
+    -o "${destination}"; then
+    return 1
   fi
+
+  validate_self_source "${destination}"
+}
+
+need_root() {
+  local action="${1:-menu}"
+  shift || true
+
+  [[ "${EUID}" -eq 0 ]] && return 0
+
+  command -v sudo >/dev/null 2>&1 \
+    || die "此操作需要 root 权限。请使用 root 运行，或安装 sudo。"
+
+  if [[ -f "${SCRIPT_SELF}" ]]; then
+    exec sudo -E bash "${SCRIPT_SELF}" "${action}" "$@"
+  fi
+
+  command -v curl >/dev/null 2>&1 \
+    || die "当前通过管道运行且缺少 curl，无法安全提权重启脚本。"
+
+  local temp_source=""
+  temp_source="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-sudo.XXXXXX.sh")"
+
+  info "当前通过 /dev/fd/管道运行；准备同版本脚本后使用 sudo 继续..."
+
+  local fetch_rc=0
+  set +e
+  fetch_self_copy "${temp_source}"
+  fetch_rc=$?
+  set -e
+
+  if [[ "${fetch_rc}" -ne 0 ]]; then
+    rm -f "${temp_source}"
+    case "${fetch_rc}" in
+      2) die "仓库脚本版本与当前运行版本不一致；为避免提权执行错版本已停止。" ;;
+      3) die "仓库脚本未通过 bash -n 语法检查；已停止。" ;;
+      *) die "无法从仓库重新获取当前版本脚本。" ;;
+    esac
+  fi
+
+  chmod 0755 "${temp_source}"
+  set +e
+  sudo -E bash "${temp_source}" "${action}" "$@"
+  local rc=$?
+  set -e
+  rm -f "${temp_source}"
+  exit "${rc}"
 }
 
 os_id() {
@@ -85,18 +174,31 @@ os_pretty() {
   fi
 }
 
+os_like() {
+  if [[ -r /etc/os-release ]]; then
+    (
+      # shellcheck disable=SC1091
+      source /etc/os-release
+      printf '%s' "${ID_LIKE:-}"
+    )
+  fi
+}
+
 host_backend() {
-  local id
+  local id like
   id="$(os_id)"
+  like="$(os_like)"
 
   if [[ "${id}" == "alpine" ]]; then
     printf '%s' "cron"
     return 0
   fi
 
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-    printf '%s' "systemd"
-    return 0
+  if [[ "${id}" == "debian" || "${id}" == "ubuntu" || " ${like} " == *" debian "* ]]; then
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+      printf '%s' "systemd"
+      return 0
+    fi
   fi
 
   printf '%s' "unsupported"
@@ -121,54 +223,84 @@ check_os() {
 ensure_dependencies() {
   info "检查依赖..."
 
-  local backend need_install=0
+  local backend cmd
   backend="$(host_backend)"
 
-  command -v bash >/dev/null 2>&1 || need_install=1
-  command -v curl >/dev/null 2>&1 || need_install=1
-  command -v timeout >/dev/null 2>&1 || need_install=1
-  command -v find >/dev/null 2>&1 || need_install=1
-  command -v awk >/dev/null 2>&1 || need_install=1
-  command -v flock >/dev/null 2>&1 || need_install=1
-  command -v nice >/dev/null 2>&1 || need_install=1
-  [[ -d /usr/share/zoneinfo ]] || need_install=1
+  local -a packages=()
+  local -a required_cmds=(
+    bash curl timeout find awk flock
+    pgrep pkill tar gzip xz zstd
+    mount umount chroot sha256sum
+    grep sed tr sort head cut mktemp
+  )
+
+  add_package_once() {
+    local pkg="$1" existing
+    for existing in "${packages[@]:-}"; do
+      [[ "${existing}" == "${pkg}" ]] && return 0
+    done
+    packages+=("${pkg}")
+  }
 
   case "${backend}" in
     systemd)
-      if [[ "${need_install}" -eq 1 ]]; then
+      command -v apt-get >/dev/null 2>&1 \
+        || die "检测到 Debian 系 systemd，但 apt-get 不可用。"
+
+      command -v curl >/dev/null 2>&1 || {
+        add_package_once curl
+        add_package_once ca-certificates
+      }
+      [[ -s /etc/ssl/certs/ca-certificates.crt ]] || add_package_once ca-certificates
+      [[ -d /usr/share/zoneinfo ]] || add_package_once tzdata
+
+      command -v timeout >/dev/null 2>&1 || add_package_once coreutils
+      command -v chroot >/dev/null 2>&1 || add_package_once coreutils
+      command -v sha256sum >/dev/null 2>&1 || add_package_once coreutils
+      command -v find >/dev/null 2>&1 || add_package_once findutils
+      command -v flock >/dev/null 2>&1 || add_package_once util-linux
+      command -v mount >/dev/null 2>&1 || add_package_once util-linux
+      command -v umount >/dev/null 2>&1 || add_package_once util-linux
+      command -v pgrep >/dev/null 2>&1 || add_package_once procps
+      command -v pkill >/dev/null 2>&1 || add_package_once procps
+      command -v tar >/dev/null 2>&1 || add_package_once tar
+      command -v gzip >/dev/null 2>&1 || add_package_once gzip
+      command -v xz >/dev/null 2>&1 || add_package_once xz-utils
+      command -v zstd >/dev/null 2>&1 || add_package_once zstd
+
+      if (( ${#packages[@]} > 0 )); then
         export DEBIAN_FRONTEND=noninteractive
-        info "安装必要依赖：bash、curl、ca-certificates、coreutils、tzdata..."
+        info "安装缺失依赖：${packages[*]}"
         apt-get update -y
-        apt-get install -y \
-          bash \
-          curl \
-          ca-certificates \
-          coreutils \
-          findutils \
-          tzdata \
-          util-linux \
-          procps
+        apt-get install -y "${packages[@]}"
       fi
       ;;
 
     cron)
-      if [[ "${need_install}" -eq 1 ]] || ! command -v crond >/dev/null 2>&1; then
-        info "安装必要依赖：bash、curl、ca-certificates、coreutils、cronie..."
-        apk add --no-cache \
-          bash \
-          curl \
-          ca-certificates \
-          coreutils \
-          findutils \
-          tzdata \
-          util-linux \
-          procps \
-          cronie \
-          cronie-openrc \
-          openrc \
-          tar \
-          xz \
-          zstd
+      command -v apk >/dev/null 2>&1 || die "检测到 Alpine，但 apk 不可用。"
+
+      command -v curl >/dev/null 2>&1 || {
+        add_package_once curl
+        add_package_once ca-certificates
+      }
+      [[ -s /etc/ssl/certs/ca-certificates.crt ]] || add_package_once ca-certificates
+      [[ -d /usr/share/zoneinfo ]] || add_package_once tzdata
+
+      command -v flock >/dev/null 2>&1 || add_package_once flock
+      command -v pgrep >/dev/null 2>&1 || add_package_once procps-ng
+      command -v pkill >/dev/null 2>&1 || add_package_once procps-ng
+      command -v crond >/dev/null 2>&1 || add_package_once cronie
+      command -v rc-update >/dev/null 2>&1 || add_package_once openrc
+      command -v rc-service >/dev/null 2>&1 || add_package_once openrc
+      [[ -x /etc/init.d/crond ]] || add_package_once cronie-openrc
+
+      command -v tar >/dev/null 2>&1 || add_package_once tar
+      command -v xz >/dev/null 2>&1 || add_package_once xz
+      command -v zstd >/dev/null 2>&1 || add_package_once zstd
+
+      if (( ${#packages[@]} > 0 )); then
+        info "安装缺失依赖：${packages[*]}"
+        apk add --no-cache "${packages[@]}"
       fi
       ;;
 
@@ -177,14 +309,20 @@ ensure_dependencies() {
       ;;
   esac
 
-  command -v bash >/dev/null 2>&1 || die "bash 不可用。"
-  command -v curl >/dev/null 2>&1 || die "curl 不可用。"
-  command -v timeout >/dev/null 2>&1 || die "timeout 不可用。"
-  command -v find >/dev/null 2>&1 || die "find 不可用。"
-  command -v awk >/dev/null 2>&1 || die "awk 不可用。"
-  command -v flock >/dev/null 2>&1 || die "flock 不可用。"
-  command -v nice >/dev/null 2>&1 || die "nice 不可用。"
+  for cmd in "${required_cmds[@]}"; do
+    command -v "${cmd}" >/dev/null 2>&1 || die "必要命令不可用：${cmd}"
+  done
+
   [[ -d /usr/share/zoneinfo ]] || die "tzdata / zoneinfo 不可用。"
+
+  if [[ "${backend}" == "systemd" ]]; then
+    command -v systemd-analyze >/dev/null 2>&1 || die "systemd-analyze 不可用。"
+  else
+    command -v rc-update >/dev/null 2>&1 || die "rc-update 不可用。"
+    command -v rc-service >/dev/null 2>&1 || die "rc-service 不可用。"
+    command -v crond >/dev/null 2>&1 || die "crond 不可用。"
+    [[ -x /etc/init.d/crond ]] || die "缺少 /etc/init.d/crond；Cronie OpenRC 服务未正确安装。"
+  fi
 }
 
 is_installed() {
@@ -248,6 +386,9 @@ load_config() {
 }
 
 save_config() {
+  local temp_conf=""
+  temp_conf="$(mktemp "${CONF_FILE}.XXXXXX")"
+
   {
     printf 'SERVER_NAME=%q\n' "${SERVER_NAME}"
     printf 'SCHEDULE_TZ=%q\n' "${SCHEDULE_TZ}"
@@ -257,9 +398,10 @@ save_config() {
     printf 'TG_THREAD_ID=%q\n' "${TG_THREAD_ID}"
     printf 'SEND_FULL_LOG=%q\n' "${SEND_FULL_LOG}"
     printf 'RUN_PROFILE=%q\n' "${RUN_PROFILE}"
-  } > "${CONF_FILE}"
+  } > "${temp_conf}"
 
-  chmod 600 "${CONF_FILE}"
+  chmod 600 "${temp_conf}"
+  mv -f "${temp_conf}" "${CONF_FILE}"
 }
 
 validate_timezone() {
@@ -452,7 +594,7 @@ prompt_config() {
   echo "运行模式："
   echo "  1) AUTO   自动判断（推荐；当前环境会选择 ${recommended_profile}）"
   echo "  2) FULL   完整标准模式：TcpQuality --all"
-  echo "  3) LOWMEM 超低内存模式：仍执行 --all，但强制 -p 1 -c 50"
+  echo "  3) LOWMEM 超低内存模式：仍执行 --all，仅强制 -p 1（保留上游默认发包数）"
   echo "当前内存：约 ${mem_mb_now} MB；Swap：约 ${swap_mb_now} MB"
 
   local profile_default="1"
@@ -487,7 +629,10 @@ prompt_config() {
 write_runner() {
   mkdir -p "$(dirname "${RUNNER}")"
 
-  cat > "${RUNNER}" <<'RUNNER_EOF'
+  local temp_runner=""
+  temp_runner="$(mktemp "$(dirname "${RUNNER}")/.${APP_NAME}-run.XXXXXX")"
+
+  cat > "${temp_runner}" <<'RUNNER_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -514,6 +659,14 @@ TEST_TIMEOUT="${TCPQUALITY_TEST_TIMEOUT:-55m}"
 source "${CONF_FILE}"
 SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
 RUN_PROFILE="${RUN_PROFILE:-AUTO}"
+
+[[ "${REPORT_RECOVERY_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] || REPORT_RECOVERY_ATTEMPTS=4
+(( REPORT_RECOVERY_ATTEMPTS > 8 )) && REPORT_RECOVERY_ATTEMPTS=8
+
+[[ "${REPORT_RECOVERY_CONNECT_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || REPORT_RECOVERY_CONNECT_TIMEOUT=15
+[[ "${REPORT_RECOVERY_MAX_TIME}" =~ ^[1-9][0-9]*$ ]] || REPORT_RECOVERY_MAX_TIME=90
+[[ "${KEEP_DAYS}" =~ ^[0-9]+$ ]] || KEEP_DAYS=14
+[[ "${TEST_TIMEOUT}" =~ ^[1-9][0-9]*[smhd]?$ ]] || TEST_TIMEOUT="55m"
 
 mkdir -p "${LOG_DIR}"
 chmod 700 "${LOG_DIR}"
@@ -553,6 +706,14 @@ resolve_run_profile() {
   fi
 }
 
+LOCK_FILE="/run/tcpquality-auto.lock"
+mkdir -p "$(dirname "${LOCK_FILE}")"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "[tcpquality-auto] 已有测试任务正在运行，本次跳过。" >&2
+  exit 0
+fi
+
 stamp="$(TZ="${SCHEDULE_TZ}" date '+%Y%m%d-%H%M%S')"
 raw_log="${LOG_DIR}/${stamp}.raw.log"
 clean_log="${LOG_DIR}/${stamp}.log"
@@ -561,31 +722,18 @@ artifact_dir="${LOG_DIR}/${stamp}.artifacts"
 TG_API="https://api.telegram.org/bot${TG_BOT_TOKEN}"
 entry_script="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-entry.XXXXXX.sh")"
 
-response_file=""
-curl_err=""
-
 cleanup() {
   rm -f "${entry_script}" 2>/dev/null || true
-  [[ -n "${response_file}" ]] && rm -f "${response_file}" 2>/dev/null || true
-  [[ -n "${curl_err}" ]] && rm -f "${curl_err}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 mkdir -p "${artifact_dir}"
 chmod 700 "${artifact_dir}"
 
-LOCK_FILE="/run/tcpquality-auto.lock"
-mkdir -p "$(dirname "${LOCK_FILE}")"
-exec 9>"${LOCK_FILE}"
-if ! flock -n 9; then
-  echo "[tcpquality-auto] 已有测试任务正在运行，本次跳过。" >&2
-  exit 75
-fi
-
 ACTIVE_PROFILE="$(resolve_run_profile)"
 declare -a TEST_ARGS=(--all)
 if [[ "${ACTIVE_PROFILE}" == "LOWMEM" ]]; then
-  TEST_ARGS=(--all -p 1 -c 50)
+  TEST_ARGS=(--all -p 1)
 fi
 
 send_message() {
@@ -675,11 +823,21 @@ extract_report_url_from_json() {
 }
 
 find_current_csv() {
-  find "${artifact_dir}" -maxdepth 1 -type f -name 'zstatic_nping_*.csv' -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr \
-    | head -n 1 \
-    | cut -d' ' -f2- \
-    || true
+  local latest="" file
+  local -a files=()
+
+  shopt -s nullglob
+  files=("${artifact_dir}"/zstatic_nping_*.csv)
+  shopt -u nullglob
+
+  for file in "${files[@]}"; do
+    [[ -f "${file}" ]] || continue
+    if [[ -z "${latest}" || "${file}" -nt "${latest}" ]]; then
+      latest="${file}"
+    fi
+  done
+
+  printf '%s' "${latest}"
 }
 
 extract_report_time() {
@@ -689,12 +847,16 @@ extract_report_time() {
     || true
 }
 
+RECOVERED_REPORT_URL=""
+
 recover_report_upload() {
   local csv="$1"
-  local recovered_url=""
-  local report_time=""
+  local recovered_url="" report_time=""
   local family attempt sleep_s curl_rc http_code
+  local response_file="" curl_err=""
   local -a report_headers=()
+
+  RECOVERED_REPORT_URL=""
 
   [[ -s "${csv}" ]] || {
     echo "[tcpquality-auto] 报告恢复上传跳过：未找到本次测试 CSV。" >> "${raw_log}"
@@ -741,7 +903,9 @@ recover_report_upload() {
 
       recovered_url="$(extract_report_url_from_json "${response_file}")"
       if [[ "${curl_rc}" -eq 0 && "${http_code}" =~ ^2[0-9][0-9]$ && -n "${recovered_url}" ]]; then
-        echo "${recovered_url}"
+        RECOVERED_REPORT_URL="${recovered_url}"
+        echo "[tcpquality-auto] 恢复上传成功：HTTP ${http_code}，${RECOVERED_REPORT_URL}" >> "${raw_log}"
+        rm -f "${response_file}" "${curl_err}"
         return 0
       fi
 
@@ -763,6 +927,7 @@ recover_report_upload() {
     done
   done
 
+  rm -f "${response_file}" "${curl_err}"
   return 1
 }
 
@@ -824,11 +989,13 @@ fi
 set +e
 if [[ "${entry_ready}" -eq 1 ]]; then
   echo "[tcpquality-auto] 入口脚本校验通过，开始执行 TcpQuality --all。" >> "${raw_log}"
+  command -v renice >/dev/null 2>&1 && renice 10 -p $$ >/dev/null 2>&1 || true
+
   TERM=xterm \
     MALLOC_ARENA_MAX=2 \
     TCPQUALITY_OUTPUT_DIR="${artifact_dir}" \
-    timeout --signal=TERM --kill-after=30s "${TEST_TIMEOUT}" \
-    nice -n 10 bash "${entry_script}" "${TEST_ARGS[@]}" \
+    timeout -s TERM -k 30s "${TEST_TIMEOUT}" \
+    bash "${entry_script}" "${TEST_ARGS[@]}" \
     >> "${raw_log}" 2>&1
   exit_code=$?
 else
@@ -858,21 +1025,22 @@ rootfs_fallback=0
 log_has 'SVG 报告上传失败|已跳过 SVG 报告上传' && report_upload_failed=1 || true
 log_has '预构建 rootfs 不可用，尝试下一来源|预构建 rootfs 下载失败，回退官方 Debian OCI|官方 Debian OCI rootfs 下载失败，尝试本地构建方式' && rootfs_fallback=1 || true
 
-if [[ -z "${report_url}" && "${exit_code}" -eq 0 ]]; then
+if [[ -z "${report_url}" && ( "${exit_code}" -eq 0 || "${report_upload_failed}" -eq 1 ) ]]; then
   current_csv="$(find_current_csv)"
   if [[ -n "${current_csv}" ]]; then
     report_recovery_attempted=1
     echo "[tcpquality-auto] 上游未返回有效 /r/ 链接，开始使用本次 CSV 在宿主机恢复上传。" >> "${raw_log}"
 
-    if recovered_report_url="$(recover_report_upload "${current_csv}")"; then
-      report_url="${recovered_report_url}"
+    if recover_report_upload "${current_csv}"; then
+      report_url="${RECOVERED_REPORT_URL}"
       report_recovered=1
-
-      sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
-        | tr '\r' '\n' \
-        > "${clean_log}" \
-        || true
     fi
+
+    # 无论恢复成功还是失败，都重新生成 clean log，确保恢复阶段诊断可见。
+    sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
+      | tr '\r' '\n' \
+      > "${clean_log}" \
+      || cp -f "${raw_log}" "${clean_log}"
   else
     echo "[tcpquality-auto] 上游未返回有效 /r/ 链接，且未找到本次测试持久化 CSV，无法恢复上传。" >> "${raw_log}"
   fi
@@ -977,9 +1145,8 @@ else
   status="failure"
 
   case "${exit_code}" in
-    75) reason="已有 TcpQuality 测试任务正在运行，本次已跳过" ;;
     90) reason="TcpQuality 入口脚本主源和备用源均下载失败" ;;
-    124|137) reason="测试超时（${TEST_TIMEOUT}）" ;;
+    124|137|143) reason="测试超时或被超时控制器终止（${TEST_TIMEOUT}）" ;;
     *)
       if [[ "${reason}" == "TcpQuality 执行异常" ]]; then
         reason="测试进程退出码 ${exit_code}"
@@ -1009,8 +1176,12 @@ if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
   send_document "${clean_log}" "${caption}" || push_failed=1
 fi
 
-find "${LOG_DIR}" -type f -mtime +"${KEEP_DAYS}" -delete 2>/dev/null || true
-find "${LOG_DIR}" -mindepth 1 -maxdepth 1 -type d -name '*.artifacts' -mtime +"${KEEP_DAYS}" -exec rm -rf {} + 2>/dev/null || true
+if [[ "${status}" == "success" ]]; then
+  rm -rf "${artifact_dir}" 2>/dev/null || true
+fi
+
+find "${LOG_DIR}" -type f -mtime +"${KEEP_DAYS}" -exec rm -f {} \; 2>/dev/null || true
+find "${LOG_DIR}" -type d -name '*.artifacts' -mtime +"${KEEP_DAYS}" -prune -exec rm -rf {} \; 2>/dev/null || true
 
 if [[ "${push_failed}" -ne 0 ]]; then
   echo "TcpQuality 状态：${status}；但 Telegram 推送失败。" >&2
@@ -1022,7 +1193,13 @@ fi
 exit "${return_code}"
 RUNNER_EOF
 
-  chmod 700 "${RUNNER}"
+  if ! bash -n "${temp_runner}"; then
+    rm -f "${temp_runner}"
+    die "生成的 runner 未通过 bash -n 语法检查。"
+  fi
+
+  chmod 700 "${temp_runner}"
+  mv -f "${temp_runner}" "${RUNNER}"
 }
 
 write_systemd_units() {
@@ -1038,7 +1215,7 @@ After=network-online.target
 Type=oneshot
 Environment=TERM=xterm
 ExecStart=${RUNNER}
-TimeoutStartSec=1h
+TimeoutStartSec=90min
 Nice=10
 
 [Install]
@@ -1059,11 +1236,21 @@ Unit=${SERVICE_UNIT}
 WantedBy=timers.target
 EOF
 
+  if ! systemd-analyze verify "${SERVICE_FILE}" "${TIMER_FILE}" >/dev/null 2>&1; then
+    systemd-analyze verify "${SERVICE_FILE}" "${TIMER_FILE}" || true
+    die "生成的 systemd unit 校验失败。"
+  fi
+
   systemctl daemon-reload
 }
 
 ensure_crond_running() {
-  rc-update add crond default >/dev/null 2>&1 || true
+  [[ -x /etc/init.d/crond ]] \
+    || die "缺少 /etc/init.d/crond，无法保证 Cronie 开机自启。"
+
+  rc-update add crond default >/dev/null 2>&1 \
+    || die "无法将 crond 加入 OpenRC default runlevel。"
+
   rc-service crond start >/dev/null 2>&1 || true
 
   if ! pgrep -x crond >/dev/null 2>&1; then
@@ -1092,43 +1279,57 @@ EOF
   ensure_crond_running
 }
 
-remove_scheduler_files() {
-  case "$(host_backend)" in
-    systemd)
-      systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
-      systemctl stop "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-      rm -f "${SERVICE_FILE}" "${TIMER_FILE}"
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      ;;
-    cron)
-      rm -f "${CRON_FILE}"
-      ;;
-  esac
-}
-
 install_manager_self() {
   mkdir -p "$(dirname "${MANAGER_PATH}")"
 
-  if [[ -f "${SCRIPT_SELF}" ]]; then
-    local current_real="" target_real=""
-    current_real="$(readlink -f "${SCRIPT_SELF}" 2>/dev/null || true)"
-    target_real="$(readlink -f "${MANAGER_PATH}" 2>/dev/null || true)"
+  local current_real="" target_real=""
+  local source_file="" temp_source="" fetch_rc=0
 
-    if [[ -n "${current_real}" && "${current_real}" == "${target_real}" ]]; then
-      chmod 755 "${MANAGER_PATH}"
-    else
-      install -m 0755 "${SCRIPT_SELF}" "${MANAGER_PATH}"
-    fi
+  current_real="$(readlink -f "${SCRIPT_SELF}" 2>/dev/null || true)"
+  target_real="$(readlink -f "${MANAGER_PATH}" 2>/dev/null || true)"
+
+  if [[ -f "${SCRIPT_SELF}" ]]; then
+    source_file="${SCRIPT_SELF}"
+    validate_self_source "${source_file}" \
+      || die "当前本地脚本版本/语法校验失败，拒绝安装管理命令。"
   else
-    die "无法安装管理脚本自身。"
+    temp_source="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-self.XXXXXX.sh")"
+    info "当前通过 /dev/fd/管道运行；重新获取同版本脚本用于安装管理命令..."
+
+    set +e
+    fetch_self_copy "${temp_source}"
+    fetch_rc=$?
+    set -e
+
+    if [[ "${fetch_rc}" -ne 0 ]]; then
+      rm -f "${temp_source}"
+      case "${fetch_rc}" in
+        2) die "仓库脚本版本与当前运行版本不一致；为避免安装错版本已停止。请确认 GitHub main 已更新。" ;;
+        3) die "仓库脚本未通过 bash -n 语法检查；已停止。" ;;
+        *) die "无法从仓库重新获取当前版本脚本：${SELF_SOURCE_URL}" ;;
+      esac
+    fi
+
+    source_file="${temp_source}"
   fi
+
+  if [[ -n "${current_real}" && -n "${target_real}" && "${current_real}" == "${target_real}" ]]; then
+    chmod 0755 "${MANAGER_PATH}"
+  else
+    cp -f "${source_file}" "${MANAGER_PATH}"
+    chmod 0755 "${MANAGER_PATH}"
+  fi
+
+  [[ -n "${temp_source}" ]] && rm -f "${temp_source}"
+
+  [[ -x "${MANAGER_PATH}" ]] || die "管理命令安装失败：${MANAGER_PATH}"
 }
 
 compute_next_run() {
   local tz="$1"
   local hhmm="$2"
 
-  local now_epoch today target_epoch next_str
+  local now_epoch today target_epoch tomorrow_date next_str
   now_epoch="$(TZ="${tz}" date +%s 2>/dev/null || true)"
   today="$(TZ="${tz}" date '+%Y-%m-%d' 2>/dev/null || true)"
   target_epoch="$(TZ="${tz}" date -d "${today} ${hhmm}:00" +%s 2>/dev/null || true)"
@@ -1138,7 +1339,9 @@ compute_next_run() {
   fi
 
   if (( target_epoch <= now_epoch )); then
-    target_epoch="$(TZ="${tz}" date -d "${today} +1 day ${hhmm}:00" +%s 2>/dev/null || true)"
+    tomorrow_date="$(TZ="${tz}" date -d "@$((now_epoch + 86400))" '+%Y-%m-%d' 2>/dev/null || true)"
+    [[ -n "${tomorrow_date}" ]] || return 1
+    target_epoch="$(TZ="${tz}" date -d "${tomorrow_date} ${hhmm}:00" +%s 2>/dev/null || true)"
   fi
 
   [[ -n "${target_epoch}" ]] || return 1
@@ -1149,7 +1352,7 @@ compute_next_run() {
 }
 
 install_or_configure() {
-  need_root "$@"
+  need_root "install" "$@"
   check_os
   ensure_dependencies
   warn_low_memory_interactive
@@ -1176,10 +1379,11 @@ install_or_configure() {
 
   case "$(host_backend)" in
     systemd)
+      rm -f "${CRON_FILE}"
       write_systemd_units
       ;;
     cron)
-      :
+      rm -f "${SERVICE_FILE}" "${TIMER_FILE}"
       ;;
   esac
 
@@ -1241,7 +1445,7 @@ install_or_configure() {
 }
 
 start_app() {
-  need_root "$@"
+  need_root "start" "$@"
   require_installed
 
   case "$(host_backend)" in
@@ -1264,7 +1468,7 @@ start_app() {
 }
 
 stop_app() {
-  need_root "$@"
+  need_root "stop" "$@"
   require_installed
 
   case "$(host_backend)" in
@@ -1285,7 +1489,7 @@ stop_app() {
 }
 
 restart_app() {
-  need_root "$@"
+  need_root "restart" "$@"
   require_installed
 
   case "$(host_backend)" in
@@ -1307,7 +1511,7 @@ restart_app() {
 }
 
 run_test() {
-  need_root "$@"
+  need_root "run" "$@"
   require_installed
   warn_low_memory_interactive
 
@@ -1341,22 +1545,42 @@ show_next_run() {
     line
   fi
 
-  if scheduler_enabled; then
-    local next_run=""
-    next_run="$(compute_next_run "${SCHEDULE_TZ}" "${RUN_TIME}" || true)"
-
-    echo "后端：$(host_backend)"
-    echo "计划：每天 ${RUN_TIME}（${SCHEDULE_TZ}）"
-
-    if [[ -n "${next_run}" ]]; then
-      echo "下一次执行：${next_run}"
-    else
-      echo "下一次执行：无法计算（请检查 date / tzdata）"
-    fi
-  else
+  if ! scheduler_enabled; then
     warn "定时任务当前未启用，因此没有活动的下一次执行计划。"
     echo "恢复任务：sudo ${APP_NAME} start"
+    return 0
   fi
+
+  echo "后端：$(host_backend)"
+  echo "计划：每天 ${RUN_TIME}（${SCHEDULE_TZ}）"
+
+  case "$(host_backend)" in
+    systemd)
+      local next_actual=""
+      next_actual="$(
+        systemctl show "${TIMER_UNIT}" \
+          -p NextElapseUSecRealtime \
+          --value 2>/dev/null \
+          || true
+      )"
+
+      if [[ -n "${next_actual}" && "${next_actual}" != "n/a" ]]; then
+        echo "下一次执行：${next_actual}"
+      else
+        systemctl list-timers "${TIMER_UNIT}" --all --no-pager || true
+      fi
+      ;;
+
+    cron)
+      local next_run=""
+      next_run="$(compute_next_run "${SCHEDULE_TZ}" "${RUN_TIME}" || true)"
+      if [[ -n "${next_run}" ]]; then
+        echo "预计下一次执行：${next_run}"
+      else
+        echo "预计下一次执行：无法计算（请检查 date / tzdata）"
+      fi
+      ;;
+  esac
 }
 
 show_status() {
@@ -1404,6 +1628,27 @@ show_status() {
   show_next_run false
 }
 
+latest_clean_log() {
+  local latest="" file base
+  local -a files=()
+
+  shopt -s nullglob
+  files=("${LOG_DIR}"/*.log)
+  shopt -u nullglob
+
+  for file in "${files[@]}"; do
+    [[ -f "${file}" ]] || continue
+    base="${file##*/}"
+    [[ "${base}" =~ ^[0-9]{8}-[0-9]{6}\.log$ ]] || continue
+
+    if [[ -z "${latest}" || "${file}" -nt "${latest}" ]]; then
+      latest="${file}"
+    fi
+  done
+
+  printf '%s' "${latest}"
+}
+
 show_logs_cli() {
   require_installed
 
@@ -1419,10 +1664,7 @@ show_logs_cli() {
   fi
 
   local latest=""
-  latest="$(find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log' ! -name '*.raw.log' -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr \
-    | head -n 1 \
-    | cut -d' ' -f2- || true)"
+  latest="$(latest_clean_log)"
 
   if [[ -n "${latest}" && -f "${latest}" ]]; then
     line
@@ -1434,8 +1676,24 @@ show_logs_cli() {
   fi
 }
 
+stop_running_test() {
+  runner_active || return 0
+
+  info "检测到 TcpQuality 测试仍在运行，正在停止..."
+  pkill -TERM -f "${RUNNER}" >/dev/null 2>&1 || true
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    runner_active || return 0
+    sleep 1
+  done
+
+  warn "测试进程未在 10 秒内退出，发送 KILL。"
+  pkill -KILL -f "${RUNNER}" >/dev/null 2>&1 || true
+}
+
 uninstall_app() {
-  need_root "$@"
+  need_root "uninstall" "$@"
 
   if is_installed; then
     case "$(host_backend)" in
@@ -1447,6 +1705,8 @@ uninstall_app() {
         rm -f "${CRON_FILE}"
         ;;
     esac
+
+    stop_running_test
   fi
 
   rm -f "${RUNNER}" "${MANAGER_PATH}" "${CONF_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}" "${CRON_FILE}"
@@ -1514,7 +1774,7 @@ interactive_menu() {
 usage() {
   cat <<EOF
 TcpQuality Auto ${APP_VERSION}
-纯 Bash / 无 Python / Debian+Alpine / 低内存自适应
+纯 Bash / 无 Python / Debian+Alpine / 低内存自适应 / 单实例保护
 
 用法：
   sudo ${APP_NAME}                 进入交互式菜单
