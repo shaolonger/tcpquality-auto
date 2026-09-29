@@ -4,11 +4,11 @@ set -Eeuo pipefail
 # ============================================================
 # TcpQuality Auto
 # Pure Bash / Low-overhead / Debian+Alpine
-# Version: 2026.09.27.10
+# Version: 2026.09.29.1
 # ============================================================
 
 APP_NAME="tcpquality-auto"
-APP_VERSION="2026.09.27.10"
+APP_VERSION="2026.09.29.1"
 
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}"
 CONF_FILE="/etc/${APP_NAME}.conf"
@@ -376,12 +376,14 @@ load_config() {
   TG_THREAD_ID=""
   SEND_FULL_LOG="N"
   RUN_PROFILE="AUTO"
+  TEST_TIMEOUT="120m"
 
   if [[ -r "${CONF_FILE}" ]]; then
     # shellcheck disable=SC1090
     source "${CONF_FILE}"
     SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
     RUN_PROFILE="${RUN_PROFILE:-AUTO}"
+    TEST_TIMEOUT="${TEST_TIMEOUT:-120m}"
   fi
 }
 
@@ -398,6 +400,7 @@ save_config() {
     printf 'TG_THREAD_ID=%q\n' "${TG_THREAD_ID}"
     printf 'SEND_FULL_LOG=%q\n' "${SEND_FULL_LOG}"
     printf 'RUN_PROFILE=%q\n' "${RUN_PROFILE}"
+    printf 'TEST_TIMEOUT=%q\n' "${TEST_TIMEOUT}"
   } > "${temp_conf}"
 
   chmod 600 "${temp_conf}"
@@ -476,6 +479,7 @@ prompt_config() {
   local old_thread="${TG_THREAD_ID:-}"
   local old_send_full_log="${SEND_FULL_LOG:-N}"
   local old_run_profile="${RUN_PROFILE:-AUTO}"
+  local old_test_timeout="${TEST_TIMEOUT:-120m}"
 
   if [[ -n "${old_server}${old_tz}${old_time}${old_token}${old_chat}${old_thread}" ]]; then
     echo
@@ -615,9 +619,21 @@ prompt_config() {
     esac
   done
 
+  while true; do
+    read -r -p "单次测试最长运行时间 [${old_test_timeout}]（30-150 分钟，如 120m）: " input
+    input="${input:-${old_test_timeout}}"
+    if [[ "${input}" =~ ^[1-9][0-9]{1,2}m$ ]] &&
+      (( ${input%m} >= 30 && ${input%m} <= 150 )); then
+      TEST_TIMEOUT="${input}"
+      break
+    fi
+    warn "请输入 30m 到 150m，例如 120m。"
+  done
+
   echo
   ok "定时设置有效：每天 ${RUN_TIME}（${SCHEDULE_TZ}）"
   ok "运行模式：${RUN_PROFILE}"
+  ok "测试超时：${TEST_TIMEOUT}"
 
   echo
   info "验证 Telegram 并发送测试消息..."
@@ -643,12 +659,12 @@ TCPQUALITY_URL="${TCPQUALITY_URL:-https://tcpquality.ibsgss.uk/run}"
 TCPQUALITY_FALLBACK_URL="${TCPQUALITY_FALLBACK_URL:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh}"
 
 REPORT_API="${TCPQUALITY_REPORT_API:-https://tcpquality.ibsgss.uk/generate}"
-REPORT_RECOVERY_ATTEMPTS="${TCPQUALITY_REPORT_RECOVERY_ATTEMPTS:-4}"
+REPORT_RECOVERY_ATTEMPTS="${TCPQUALITY_REPORT_RECOVERY_ATTEMPTS:-2}"
 REPORT_RECOVERY_CONNECT_TIMEOUT="${TCPQUALITY_REPORT_RECOVERY_CONNECT_TIMEOUT:-15}"
 REPORT_RECOVERY_MAX_TIME="${TCPQUALITY_REPORT_RECOVERY_MAX_TIME:-90}"
 
 KEEP_DAYS="${TCPQUALITY_KEEP_DAYS:-14}"
-TEST_TIMEOUT="${TCPQUALITY_TEST_TIMEOUT:-55m}"
+TEST_TIMEOUT="${TCPQUALITY_TEST_TIMEOUT:-120m}"
 
 [[ -r "${CONF_FILE}" ]] || {
   echo "缺少配置：${CONF_FILE}" >&2
@@ -660,13 +676,13 @@ source "${CONF_FILE}"
 SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
 RUN_PROFILE="${RUN_PROFILE:-AUTO}"
 
-[[ "${REPORT_RECOVERY_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] || REPORT_RECOVERY_ATTEMPTS=4
+[[ "${REPORT_RECOVERY_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] || REPORT_RECOVERY_ATTEMPTS=2
 (( REPORT_RECOVERY_ATTEMPTS > 8 )) && REPORT_RECOVERY_ATTEMPTS=8
 
 [[ "${REPORT_RECOVERY_CONNECT_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || REPORT_RECOVERY_CONNECT_TIMEOUT=15
 [[ "${REPORT_RECOVERY_MAX_TIME}" =~ ^[1-9][0-9]*$ ]] || REPORT_RECOVERY_MAX_TIME=90
 [[ "${KEEP_DAYS}" =~ ^[0-9]+$ ]] || KEEP_DAYS=14
-[[ "${TEST_TIMEOUT}" =~ ^[1-9][0-9]*[smhd]?$ ]] || TEST_TIMEOUT="55m"
+[[ "${TEST_TIMEOUT}" =~ ^[1-9][0-9]*[smhd]?$ ]] || TEST_TIMEOUT="120m"
 
 mkdir -p "${LOG_DIR}"
 chmod 700 "${LOG_DIR}"
@@ -715,6 +731,12 @@ if ! flock -n 9; then
 fi
 
 stamp="$(TZ="${SCHEDULE_TZ}" date '+%Y%m%d-%H%M%S')"
+base_stamp="${stamp}"
+stamp_suffix=1
+while [[ -e "${LOG_DIR}/${stamp}.raw.log" || -e "${LOG_DIR}/${stamp}.log" || -e "${LOG_DIR}/${stamp}.artifacts" ]]; do
+  stamp="${base_stamp}-${stamp_suffix}"
+  stamp_suffix=$((stamp_suffix + 1))
+done
 raw_log="${LOG_DIR}/${stamp}.raw.log"
 clean_log="${LOG_DIR}/${stamp}.log"
 artifact_dir="${LOG_DIR}/${stamp}.artifacts"
@@ -822,12 +844,12 @@ extract_report_url_from_json() {
     || true
 }
 
-find_current_csv() {
-  local latest="" file
+find_report_csv() {
+  local directory="$1" latest="" file
   local -a files=()
 
   shopt -s nullglob
-  files=("${artifact_dir}"/zstatic_nping_*.csv)
+  files=("${directory}"/zstatic_nping_*.csv)
   shopt -u nullglob
 
   for file in "${files[@]}"; do
@@ -851,7 +873,8 @@ RECOVERED_REPORT_URL=""
 
 recover_report_upload() {
   local csv="$1"
-  local recovered_url="" report_time=""
+  local report_time="${2:-}" attempts="${3:-${REPORT_RECOVERY_ATTEMPTS}}"
+  local recovered_url=""
   local family attempt sleep_s curl_rc http_code
   local response_file="" curl_err=""
   local -a report_headers=()
@@ -863,7 +886,6 @@ recover_report_upload() {
     return 1
   }
 
-  report_time="$(extract_report_time)"
   if [[ -n "${report_time}" ]]; then
     report_headers+=(-H "X-Report-Time: ${report_time}")
   fi
@@ -872,7 +894,7 @@ recover_report_upload() {
   curl_err="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-report-curl.XXXXXX")"
 
   for family in ipv4 auto; do
-    for ((attempt=1; attempt<=REPORT_RECOVERY_ATTEMPTS; attempt++)); do
+    for ((attempt=1; attempt<=attempts; attempt++)); do
       : > "${response_file}"
       : > "${curl_err}"
       http_code=""
@@ -883,9 +905,6 @@ recover_report_upload() {
         --show-error
         --connect-timeout "${REPORT_RECOVERY_CONNECT_TIMEOUT}"
         --max-time "${REPORT_RECOVERY_MAX_TIME}"
-        --retry 2
-        --retry-delay 2
-        --retry-max-time 180
         -o "${response_file}"
         -w '%{http_code}'
         -H 'Content-Type: text/csv; charset=utf-8'
@@ -898,7 +917,7 @@ recover_report_upload() {
         curl_args=(-4 "${curl_args[@]}")
       fi
 
-      echo "[tcpquality-auto] 恢复上传：协议栈=${family}，第 ${attempt}/${REPORT_RECOVERY_ATTEMPTS} 次。" >> "${raw_log}"
+      echo "[tcpquality-auto] 恢复上传：协议栈=${family}，第 ${attempt}/${attempts} 次。" >> "${raw_log}"
       http_code="$(curl "${curl_args[@]}" 2>"${curl_err}")" || curl_rc=$?
 
       recovered_url="$(extract_report_url_from_json "${response_file}")"
@@ -919,7 +938,7 @@ recover_report_upload() {
         fi
       } >> "${raw_log}"
 
-      if (( attempt < REPORT_RECOVERY_ATTEMPTS )); then
+      if (( attempt < attempts )); then
         sleep_s=$((5 * (1 << (attempt - 1))))
         (( sleep_s > 40 )) && sleep_s=40
         sleep "${sleep_s}"
@@ -929,6 +948,57 @@ recover_report_upload() {
 
   rm -f "${response_file}" "${curl_err}"
   return 1
+}
+
+retry_pending_reports() {
+  local marker directory csv original_time run_id processed=0
+  local -a markers=() directories=()
+
+  shopt -s nullglob
+  directories=("${LOG_DIR}"/*.artifacts)
+  for directory in "${directories[@]}"; do
+    [[ -f "${directory}/pending-upload" || -f "${directory}/uploaded-url" ]] && continue
+    csv="$(find_report_csv "${directory}")"
+    [[ -n "${csv}" ]] || continue
+    run_id="$(basename "${directory}" .artifacts)"
+    if ! grep -Eq 'https?://tcpquality\.ibsgss\.uk/r/[A-Za-z0-9_-]+' \
+      "${LOG_DIR}/${run_id}.log" 2>/dev/null; then
+      grep -E '报告时间：' "${LOG_DIR}/${run_id}.log" 2>/dev/null \
+        | tail -n 1 \
+        | sed -E 's/.*报告时间：[[:space:]]*//; s/[[:space:]]*$//' \
+        > "${directory}/pending-upload" || true
+    fi
+  done
+  markers=("${LOG_DIR}"/*.artifacts/pending-upload)
+  shopt -u nullglob
+
+  for marker in "${markers[@]}"; do
+    # 每轮最多补传两个旧报告，避免服务不可用时拖慢当天的测试。
+    (( processed < 2 )) || break
+    directory="${marker%/pending-upload}"
+    csv="$(find_report_csv "${directory}")"
+    if [[ -z "${csv}" ]]; then
+      echo "[tcpquality-auto] 历史报告补传跳过：${directory} 中没有 CSV。" >> "${raw_log}"
+      rm -f "${marker}"
+      continue
+    fi
+
+    processed=$((processed + 1))
+    run_id="$(basename "${directory}" .artifacts)"
+    original_time="$(head -n 1 "${marker}" 2>/dev/null || true)"
+    echo "[tcpquality-auto] 重试历史报告：${run_id}。" >> "${raw_log}"
+    if recover_report_upload "${csv}" "${original_time}" 1; then
+      printf '%s\n' "${RECOVERED_REPORT_URL}" > "${directory}/uploaded-url"
+      rm -f "${marker}"
+      send_message "✅ TcpQuality 历史报告补传成功
+
+服务器：${SERVER_NAME}
+测试批次：${run_id}
+在线结果：
+${RECOVERED_REPORT_URL}" \
+        || echo "[tcpquality-auto] 历史报告已补传，但 Telegram 通知失败：${run_id}。" >> "${raw_log}"
+    fi
+  done
 }
 
 log_has() {
@@ -965,6 +1035,22 @@ diagnose_failure() {
 
 start_time="$(now_local)"
 : > "${raw_log}"
+
+retry_pending_reports
+if [[ "${1:-}" == "retry" ]]; then
+  sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
+    | tr '\r' '\n' > "${clean_log}" || cp -f "${raw_log}" "${clean_log}"
+  rmdir "${artifact_dir}" 2>/dev/null || true
+  shopt -s nullglob
+  pending_reports=("${LOG_DIR}"/*.artifacts/pending-upload)
+  shopt -u nullglob
+  if (( ${#pending_reports[@]} > 0 )); then
+    echo "[tcpquality-auto] 仍有 ${#pending_reports[@]} 份报告待补传。日志：${clean_log}" >&2
+    exit 1
+  fi
+  echo "[tcpquality-auto] 历史报告补传检查完成，无待补传报告。日志：${clean_log}"
+  exit 0
+fi
 
 mem_kb="$(memory_total_kb)"
 swap_kb="$(swap_total_kb)"
@@ -1009,8 +1095,6 @@ sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
   > "${clean_log}" \
   || cp -f "${raw_log}" "${clean_log}"
 
-end_time="$(now_local)"
-
 report_url="$(
   grep -Eo 'https?://tcpquality\.ibsgss\.uk/r/[A-Za-z0-9_-]+' "${clean_log}" 2>/dev/null \
     | tail -n 1 \
@@ -1021,31 +1105,35 @@ report_upload_failed=0
 report_recovered=0
 report_recovery_attempted=0
 rootfs_fallback=0
+current_csv=""
 
 log_has 'SVG 报告上传失败|已跳过 SVG 报告上传' && report_upload_failed=1 || true
 log_has '预构建 rootfs 不可用，尝试下一来源|预构建 rootfs 下载失败，回退官方 Debian OCI|官方 Debian OCI rootfs 下载失败，尝试本地构建方式' && rootfs_fallback=1 || true
 
 if [[ -z "${report_url}" && ( "${exit_code}" -eq 0 || "${report_upload_failed}" -eq 1 ) ]]; then
-  current_csv="$(find_current_csv)"
+  current_csv="$(find_report_csv "${artifact_dir}")"
   if [[ -n "${current_csv}" ]]; then
     report_recovery_attempted=1
     echo "[tcpquality-auto] 上游未返回有效 /r/ 链接，开始使用本次 CSV 在宿主机恢复上传。" >> "${raw_log}"
 
-    if recover_report_upload "${current_csv}"; then
+    if recover_report_upload "${current_csv}" "$(extract_report_time)"; then
       report_url="${RECOVERED_REPORT_URL}"
       report_recovered=1
+    else
+      extract_report_time > "${artifact_dir}/pending-upload"
+      echo "[tcpquality-auto] 本次报告已加入待补传队列：${current_csv}" >> "${raw_log}"
     fi
 
-    # 无论恢复成功还是失败，都重新生成 clean log，确保恢复阶段诊断可见。
-    sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
-      | tr '\r' '\n' \
-      > "${clean_log}" \
-      || cp -f "${raw_log}" "${clean_log}"
   else
     echo "[tcpquality-auto] 上游未返回有效 /r/ 链接，且未找到本次测试持久化 CSV，无法恢复上传。" >> "${raw_log}"
   fi
 fi
 
+# 补传结果与 CSV 缺失诊断都要留在用户可读的日志中。
+sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
+  | tr '\r' '\n' > "${clean_log}" || cp -f "${raw_log}" "${clean_log}"
+
+end_time="$(now_local)"
 reason="$(diagnose_failure)"
 status=""
 msg=""
@@ -1133,7 +1221,17 @@ elif [[ "${exit_code}" -eq 0 ]]; then
 完成：${end_time}
 原因：${reason}
 
-建议：查看本地测试日志确认具体阶段；不会再把 rootfs 下载地址误报为测试结果。"
+建议：查看本地测试日志确认具体阶段。"
+  if [[ "${report_recovery_attempted}" -eq 1 ]]; then
+    upload_status="$(grep '恢复上传未成功：' "${clean_log}" | tail -n 1 | sed 's/^.*恢复上传未成功：//' || true)"
+    [[ -z "${upload_status}" ]] || msg="${msg}
+补传诊断：${upload_status}"
+  fi
+  if [[ -f "${artifact_dir}/pending-upload" ]]; then
+    msg="${msg}
+
+CSV 已保留；下次定时执行会自动补传，也可运行 sudo tcpquality-auto retry。"
+  fi
   if [[ -n "${low_mem_note}" ]]; then
     msg="${msg}
 
@@ -1215,7 +1313,7 @@ After=network-online.target
 Type=oneshot
 Environment=TERM=xterm
 ExecStart=${RUNNER}
-TimeoutStartSec=90min
+TimeoutStartSec=3h
 Nice=10
 
 [Install]
@@ -1413,6 +1511,7 @@ install_or_configure() {
   echo "计划：  每天 ${RUN_TIME}"
   echo "时区：  ${SCHEDULE_TZ}"
   echo "模式：  ${RUN_PROFILE}"
+  echo "超时：  ${TEST_TIMEOUT}"
   if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
     echo "TG日志：发送完整测试日志"
   else
@@ -1533,6 +1632,18 @@ run_test() {
   fi
 }
 
+retry_reports() {
+  need_root "retry" "$@"
+  require_installed
+
+  if runner_active; then
+    warn "已有 TcpQuality 任务正在运行，请稍后重试。"
+    return 1
+  fi
+
+  "${RUNNER}" retry
+}
+
 show_next_run() {
   local heading="${1:-true}"
   require_installed
@@ -1604,6 +1715,7 @@ show_status() {
   printf '%-18s %s\n' "执行时间：" "${RUN_TIME:-未知}"
   printf '%-18s %s\n' "任务时区：" "${SCHEDULE_TZ:-未知}"
   printf '%-18s %s\n' "运行模式：" "${RUN_PROFILE:-AUTO}"
+  printf '%-18s %s\n' "测试超时：" "${TEST_TIMEOUT:-120m}"
   printf '%-18s %s\n' "Chat ID：" "${TG_CHAT_ID:-未知}"
   printf '%-18s %s\n' "Thread ID：" "${TG_THREAD_ID:-未设置}"
   printf '%-18s %s\n' "Bot Token：" "已配置（不显示）"
@@ -1639,7 +1751,7 @@ latest_clean_log() {
   for file in "${files[@]}"; do
     [[ -f "${file}" ]] || continue
     base="${file##*/}"
-    [[ "${base}" =~ ^[0-9]{8}-[0-9]{6}\.log$ ]] || continue
+    [[ "${base}" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?\.log$ ]] || continue
 
     if [[ -z "${latest}" || "${file}" -nt "${latest}" ]]; then
       latest="${file}"
@@ -1737,6 +1849,7 @@ show_menu() {
 8) 重启定时任务
 9) 查看下一次执行时间
 10) 停止并卸载
+11) 重试历史报告上传
 0) 退出
 EOF
   echo
@@ -1746,7 +1859,7 @@ interactive_menu() {
   local choice=""
   while true; do
     show_menu
-    read -r -p "请选择 [0-10]: " choice
+    read -r -p "请选择 [0-11]: " choice
     case "${choice}" in
       1) install_or_configure "$@"; pause_menu ;;
       2) run_test "$@"; pause_menu ;;
@@ -1765,6 +1878,7 @@ interactive_menu() {
         fi
         pause_menu
         ;;
+      11) retry_reports "$@"; pause_menu ;;
       0) exit 0 ;;
       *) warn "无效选项，请重新输入。"; sleep 1 ;;
     esac
@@ -1781,6 +1895,7 @@ TcpQuality Auto ${APP_VERSION}
   sudo ${APP_NAME} install         安装 / 更新
   sudo ${APP_NAME} config          修改配置
   sudo ${APP_NAME} run             立即执行一次测试
+  sudo ${APP_NAME} retry           重试历史报告上传
   sudo ${APP_NAME} status          查看状态
   sudo ${APP_NAME} logs            查看日志
   sudo ${APP_NAME} start           启动 / 恢复定时任务
@@ -1806,6 +1921,10 @@ main() {
     run)
       shift || true
       run_test "$@"
+      ;;
+    retry)
+      shift || true
+      retry_reports "$@"
       ;;
     status)
       shift || true

@@ -59,11 +59,12 @@
 - 支持 Telegram Forum / Topic
 - 自动发送测试完成 / 失败摘要
 - 自动尝试提取 TcpQuality 在线结果 URL
+- 上传失败时保留 CSV；后续定时运行自动补传，也支持手动重试
 - 可选择是否发送完整测试日志附件
 - **完整日志附件默认不发送**
 - 完整日志始终保存在 VPS 本地
 - Telegram 请求内置基础重试
-- 单次测试 55 分钟超时保护
+- 单次测试默认 120 分钟超时保护，可按 VPS 设置 30–150 分钟
 - systemd 非交互环境固定使用 `TERM=xterm`
 - 默认保留最近 14 天测试日志
 - 支持立即手动测试
@@ -110,6 +111,7 @@ bash <(curl -sL https://raw.githubusercontent.com/shaolonger/tcpquality-auto/mai
 8) 重启定时任务
 9) 查看下一次执行时间
 10) 停止并卸载
+11) 重试历史报告上传
 0) 退出
 ```
 
@@ -613,6 +615,7 @@ sudo tcpquality-auto
 8) 重启定时任务
 9) 查看下一次执行时间
 10) 停止并卸载
+11) 重试历史报告上传
 0) 退出
 ```
 
@@ -630,6 +633,7 @@ sudo tcpquality-auto
 | 查看状态 | `sudo tcpquality-auto status` |
 | 查看日志 | `sudo tcpquality-auto logs` |
 | 立即测试 | `sudo tcpquality-auto run` |
+| 重试历史报告上传 | `sudo tcpquality-auto retry` |
 | 启动任务 | `sudo tcpquality-auto start` |
 | 停止任务 | `sudo tcpquality-auto stop` |
 | 重启 Timer | `sudo tcpquality-auto restart` |
@@ -712,6 +716,8 @@ sudo tcpquality-auto run
 2. 发送 Telegram 摘要；
 3. 尝试附带在线结果 URL；
 4. 如果启用了 `SEND_FULL_LOG=Y`，再发送完整日志附件。
+
+若在线报告暂时无法上传，而上游已生成 CSV，脚本会把 CSV 留在本地。之后的定时运行最多重试两个历史报告；也可手动执行 `sudo tcpquality-auto retry`。补传成功后会再发送一条带在线链接的 Telegram 消息。历史 CSV 与日志按保留天数清理，默认 14 天。若上游未生成 CSV，无法补传，需查看本地日志并重新测试。
 
 ---
 
@@ -1091,19 +1097,19 @@ TcpQuality --all
 单次 TcpQuality 最大运行时间：
 
 ```text
-55 分钟
+默认 120 分钟；安装或修改配置时可设置为 30–150 分钟
 ```
 
 Runner 使用：
 
 ```bash
-timeout --signal=TERM --kill-after=30s 55m
+timeout --signal=TERM --kill-after=30s 120m
 ```
 
 systemd Service 还设置：
 
 ```ini
-TimeoutStartSec=1h
+TimeoutStartSec=3h
 ```
 
 形成第二层保护。
