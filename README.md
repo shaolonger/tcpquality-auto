@@ -62,6 +62,7 @@
 - 上传失败时保留并通过 Telegram 发送原始 CSV；后续定时运行自动补传，也支持手动重试
 - 测试进程结束但报告不可用时返回非零状态，让 systemd 显示异常
 - Telegram 摘要标明实际 Runner 版本，状态页检查管理脚本与 Runner 是否一致
+- 每天检查 GitHub 最新正式 Release，验证版本和语法后自动更新；升级命令失败时回滚
 - 可选择是否发送完整测试日志附件
 - **完整日志附件默认不发送**
 - 完整日志始终保存在 VPS 本地
@@ -115,6 +116,7 @@ bash <(curl -sL https://raw.githubusercontent.com/shaolonger/tcpquality-auto/mai
 10) 停止并卸载
 11) 重试历史报告上传
 12) 按现有配置升级脚本
+13) 立即检查正式版本更新
 0) 退出
 ```
 
@@ -620,6 +622,7 @@ sudo tcpquality-auto
 10) 停止并卸载
 11) 重试历史报告上传
 12) 按现有配置升级脚本
+13) 立即检查正式版本更新
 0) 退出
 ```
 
@@ -634,6 +637,7 @@ sudo tcpquality-auto
 | 打开管理菜单 | `sudo tcpquality-auto` |
 | 安装 / 更新 | `sudo tcpquality-auto install` |
 | 按现有配置升级 | `sudo bash /tmp/tcpquality-auto-install.sh upgrade` |
+| 立即检查正式版本更新 | `sudo tcpquality-auto auto-update` |
 | 修改配置 | `sudo tcpquality-auto config` |
 | 查看状态 | `sudo tcpquality-auto status` |
 | 查看日志 | `sudo tcpquality-auto logs` |
@@ -1319,6 +1323,16 @@ sudo tcpquality-auto status
 ```
 
 也会同步更新为当前脚本版本。
+
+## 自动更新
+
+安装或升级到支持自动更新的版本后，默认启用每日检查。systemd 会在 03:15 UTC 后随机延迟最多 30 分钟检查；Alpine Cronie 会在 VPS 本地时间 03:17 检查。只读取本仓库 GitHub 的最新**正式 Release**，不安装预发布版本，也不因 `main` 分支的新提交而升级。
+
+更新器会校验 Release 标签、下载脚本内的版本号和 Bash 语法，仅在版本号高于本机时执行升级。升级保留 `/etc/tcpquality-auto.conf` 和原有定时任务启停状态；若升级命令返回失败，会尝试恢复更新前的管理脚本、Runner 与调度文件。网络检查失败时继续使用原版本，下次定时检查会重试。测试正在运行时会跳过本次更新。可运行 `sudo tcpquality-auto status` 查看自动更新是否启用，或运行 `sudo tcpquality-auto auto-update` 立即检查。
+
+在 `sudo tcpquality-auto config` 中可以关闭或重新启用自动更新。`sudo tcpquality-auto stop` 会同时停止测试与自动更新定时任务。systemd 的更新日志可通过 `sudo journalctl -u tcpquality-auto-update.service -n 100 --no-pager` 查看；Cronie 的更新日志在 `/var/log/tcpquality-auto/update.log`。
+
+**已有 VPS 需要手动升级到支持自动更新的版本一次**；此前安装的旧脚本无法自行获得此功能。以后发布的新正式版本会由 VPS 自动安装。
 
 ---
 

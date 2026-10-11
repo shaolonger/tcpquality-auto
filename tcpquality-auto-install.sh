@@ -4,11 +4,11 @@ set -Eeuo pipefail
 # ============================================================
 # TcpQuality Auto
 # Pure Bash / Low-overhead / Debian+Alpine
-# Version: 2026.10.11.2
+# Version: 2026.10.11.3
 # ============================================================
 
 APP_NAME="tcpquality-auto"
-APP_VERSION="2026.10.11.2"
+APP_VERSION="2026.10.11.3"
 
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}"
 CONF_FILE="/etc/${APP_NAME}.conf"
@@ -18,10 +18,16 @@ SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 TIMER_FILE="/etc/systemd/system/${APP_NAME}.timer"
 SERVICE_UNIT="${APP_NAME}.service"
 TIMER_UNIT="${APP_NAME}.timer"
+UPDATE_SERVICE_FILE="/etc/systemd/system/${APP_NAME}-update.service"
+UPDATE_TIMER_FILE="/etc/systemd/system/${APP_NAME}-update.timer"
+UPDATE_SERVICE_UNIT="${APP_NAME}-update.service"
+UPDATE_TIMER_UNIT="${APP_NAME}-update.timer"
 
 CRON_FILE="/etc/cron.d/${APP_NAME}"
 
 LOG_DIR="/var/log/${APP_NAME}"
+RELEASE_API_URL="https://api.github.com/repos/shaolonger/tcpquality-auto/releases/latest"
+RELEASE_RAW_BASE="https://raw.githubusercontent.com/shaolonger/tcpquality-auto"
 
 SELF_SOURCE_URL="${TCPQUALITY_AUTO_SELF_URL:-https://raw.githubusercontent.com/shaolonger/tcpquality-auto/main/tcpquality-auto-install.sh}"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
@@ -87,6 +93,26 @@ validate_self_source() {
   [[ "${found_version}" == "${APP_VERSION}" ]] || return 2
   bash -n "${file}" >/dev/null 2>&1 || return 3
   return 0
+}
+
+source_version() {
+  sed -nE 's/^APP_VERSION="([^"]+)".*/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+version_is_newer() {
+  local next_version="$1" current_version="$2" i next_num current_num
+  local -a next_parts=() current_parts=()
+  [[ "${next_version}" =~ ^([0-9]{4})\.([0-9]{2})\.([0-9]{2})\.([0-9]{1,6})$ ]] || return 2
+  next_parts=("${BASH_REMATCH[@]:1}")
+  [[ "${current_version}" =~ ^([0-9]{4})\.([0-9]{2})\.([0-9]{2})\.([0-9]{1,6})$ ]] || return 2
+  current_parts=("${BASH_REMATCH[@]:1}")
+  for ((i=0; i<4; i++)); do
+    next_num=$((10#${next_parts[i]}))
+    current_num=$((10#${current_parts[i]}))
+    (( next_num > current_num )) && return 0
+    (( next_num < current_num )) && return 1
+  done
+  return 1
 }
 
 fetch_self_copy() {
@@ -363,6 +389,16 @@ scheduler_active() {
   esac
 }
 
+sync_update_timer() {
+  [[ "$(host_backend)" == "systemd" ]] || return 0
+  load_config
+  if scheduler_enabled && [[ "${AUTO_UPDATE^^}" == "Y" ]]; then
+    systemctl enable --now "${UPDATE_TIMER_UNIT}" >/dev/null
+  else
+    systemctl disable --now "${UPDATE_TIMER_UNIT}" >/dev/null 2>&1 || true
+  fi
+}
+
 runner_active() {
   pgrep -f "${RUNNER}" >/dev/null 2>&1
 }
@@ -377,6 +413,7 @@ load_config() {
   SEND_FULL_LOG="N"
   RUN_PROFILE="AUTO"
   TEST_TIMEOUT="120m"
+  AUTO_UPDATE="Y"
 
   if [[ -r "${CONF_FILE}" ]]; then
     # shellcheck disable=SC1090
@@ -384,6 +421,7 @@ load_config() {
     SEND_FULL_LOG="${SEND_FULL_LOG:-N}"
     RUN_PROFILE="${RUN_PROFILE:-AUTO}"
     TEST_TIMEOUT="${TEST_TIMEOUT:-120m}"
+    AUTO_UPDATE="${AUTO_UPDATE:-Y}"
   fi
 }
 
@@ -401,6 +439,7 @@ save_config() {
     printf 'SEND_FULL_LOG=%q\n' "${SEND_FULL_LOG}"
     printf 'RUN_PROFILE=%q\n' "${RUN_PROFILE}"
     printf 'TEST_TIMEOUT=%q\n' "${TEST_TIMEOUT}"
+    printf 'AUTO_UPDATE=%q\n' "${AUTO_UPDATE}"
   } > "${temp_conf}"
 
   chmod 600 "${temp_conf}"
@@ -480,6 +519,7 @@ prompt_config() {
   local old_send_full_log="${SEND_FULL_LOG:-N}"
   local old_run_profile="${RUN_PROFILE:-AUTO}"
   local old_test_timeout="${TEST_TIMEOUT:-120m}"
+  local old_auto_update="${AUTO_UPDATE:-Y}"
 
   if [[ -n "${old_server}${old_tz}${old_time}${old_token}${old_chat}${old_thread}" ]]; then
     echo
@@ -630,6 +670,15 @@ prompt_config() {
     warn "请输入 30m 到 150m，例如 120m。"
   done
 
+  while true; do
+    read -r -p "是否自动安装 GitHub 正式 Release 更新？[Y/n]（当前：${old_auto_update}）: " input
+    case "${input:-${old_auto_update}}" in
+      y|Y|yes|YES|Yes) AUTO_UPDATE="Y"; break ;;
+      n|N|no|NO|No) AUTO_UPDATE="N"; break ;;
+      *) warn "请输入 y 或 n。" ;;
+    esac
+  done
+
   echo
   ok "定时设置有效：每天 ${RUN_TIME}（${SCHEDULE_TZ}）"
   ok "运行模式：${RUN_PROFILE}"
@@ -652,7 +701,7 @@ write_runner() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-RUNNER_VERSION="2026.10.11.2"
+RUNNER_VERSION="2026.10.11.3"
 CONF_FILE="/etc/tcpquality-auto.conf"
 LOG_DIR="/var/log/tcpquality-auto"
 
@@ -1388,8 +1437,34 @@ Unit=${SERVICE_UNIT}
 WantedBy=timers.target
 EOF
 
-  if ! systemd-analyze verify "${SERVICE_FILE}" "${TIMER_FILE}" >/dev/null 2>&1; then
-    systemd-analyze verify "${SERVICE_FILE}" "${TIMER_FILE}" || true
+  cat > "${UPDATE_SERVICE_FILE}" <<EOF
+[Unit]
+Description=Update TcpQuality Auto from latest GitHub Release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${MANAGER_PATH} auto-update
+TimeoutStartSec=20m
+EOF
+
+  cat > "${UPDATE_TIMER_FILE}" <<EOF
+[Unit]
+Description=Check TcpQuality Auto releases daily
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=${UPDATE_SERVICE_UNIT}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  if ! systemd-analyze verify "${SERVICE_FILE}" "${TIMER_FILE}" "${UPDATE_SERVICE_FILE}" "${UPDATE_TIMER_FILE}" >/dev/null 2>&1; then
+    systemd-analyze verify "${SERVICE_FILE}" "${TIMER_FILE}" "${UPDATE_SERVICE_FILE}" "${UPDATE_TIMER_FILE}" || true
     die "生成的 systemd unit 校验失败。"
   fi
 
@@ -1423,6 +1498,7 @@ write_cron_file() {
   cat > "${CRON_FILE}" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+$(if [[ "${AUTO_UPDATE^^}" == "Y" ]]; then printf '17 3 * * * root %s auto-update >> %s/update.log 2>&1' "${MANAGER_PATH}" "${LOG_DIR}"; fi)
 CRON_TZ=${SCHEDULE_TZ}
 ${mm} ${hh} * * * root ${RUNNER} >> ${LOG_DIR}/cron.log 2>&1
 EOF
@@ -1435,7 +1511,7 @@ install_manager_self() {
   mkdir -p "$(dirname "${MANAGER_PATH}")"
 
   local current_real="" target_real=""
-  local source_file="" temp_source="" fetch_rc=0
+  local source_file="" temp_source="" temp_target="" fetch_rc=0
 
   current_real="$(readlink -f "${SCRIPT_SELF}" 2>/dev/null || true)"
   target_real="$(readlink -f "${MANAGER_PATH}" 2>/dev/null || true)"
@@ -1468,8 +1544,10 @@ install_manager_self() {
   if [[ -n "${current_real}" && -n "${target_real}" && "${current_real}" == "${target_real}" ]]; then
     chmod 0755 "${MANAGER_PATH}"
   else
-    cp -f "${source_file}" "${MANAGER_PATH}"
-    chmod 0755 "${MANAGER_PATH}"
+    temp_target="$(mktemp "${MANAGER_PATH}.XXXXXX")"
+    cp "${source_file}" "${temp_target}" || { rm -f "${temp_target}"; die "写入管理命令失败。"; }
+    chmod 0755 "${temp_target}"
+    mv -f "${temp_target}" "${MANAGER_PATH}"
   fi
 
   [[ -n "${temp_source}" ]] && rm -f "${temp_source}"
@@ -1535,7 +1613,7 @@ install_or_configure() {
       write_systemd_units
       ;;
     cron)
-      rm -f "${SERVICE_FILE}" "${TIMER_FILE}"
+      rm -f "${SERVICE_FILE}" "${TIMER_FILE}" "${UPDATE_SERVICE_FILE}" "${UPDATE_TIMER_FILE}"
       ;;
   esac
 
@@ -1550,6 +1628,7 @@ install_or_configure() {
       case "$(host_backend)" in
         systemd)
           systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
+          sync_update_timer
           ;;
         cron)
           rm -f "${CRON_FILE}"
@@ -1566,6 +1645,7 @@ install_or_configure() {
   echo "时区：  ${SCHEDULE_TZ}"
   echo "模式：  ${RUN_PROFILE}"
   echo "超时：  ${TEST_TIMEOUT}"
+  echo "自动更新：${AUTO_UPDATE^^}（GitHub 正式 Release）"
   if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
     echo "TG日志：发送完整测试日志"
   else
@@ -1624,9 +1704,10 @@ upgrade_app() {
       else
         systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
       fi
+      sync_update_timer
       ;;
     cron)
-      rm -f "${SERVICE_FILE}" "${TIMER_FILE}"
+      rm -f "${SERVICE_FILE}" "${TIMER_FILE}" "${UPDATE_SERVICE_FILE}" "${UPDATE_TIMER_FILE}"
       if [[ "${was_enabled}" -eq 1 ]]; then
         write_cron_file
       else
@@ -1638,6 +1719,97 @@ upgrade_app() {
   ok "已升级到 ${APP_VERSION}，原有配置和定时任务启停状态已保留。"
 }
 
+auto_update_app() (
+  need_root "auto-update" "$@"
+  require_installed
+  if runner_active; then
+    info "测试正在运行，自动更新延后到下一次检查。"
+    return 0
+  fi
+
+  local update_lock_fd temp_dir release_tag latest_version downloaded_version
+  local file index rc=0 backend test_enabled=0 test_active=0 update_enabled=0 update_active=0
+  local -a paths=("${MANAGER_PATH}" "${RUNNER}" "${CONF_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}" "${UPDATE_SERVICE_FILE}" "${UPDATE_TIMER_FILE}" "${CRON_FILE}")
+
+  exec {update_lock_fd}>"/run/${APP_NAME}-update.lock"
+  if ! flock -n "${update_lock_fd}"; then
+    info "另一项更新正在进行，本次检查跳过。"
+    return 0
+  fi
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-update.XXXXXX")"
+  trap 'rm -rf "${temp_dir}"' EXIT
+
+  curl -fsSL --proto '=https' --proto-redir '=https' \
+    --retry 2 --connect-timeout 10 --max-time 60 \
+    -H 'Accept: application/vnd.github+json' \
+    "${RELEASE_API_URL}" -o "${temp_dir}/release.json" \
+    || die "无法检查 GitHub 正式 Release；现有版本保持不变。"
+
+  release_tag="$(sed -nE 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "${temp_dir}/release.json" | head -n 1)"
+  [[ "${release_tag}" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{1,6}$ ]] \
+    || die "GitHub Release 标签格式异常；现有版本保持不变。"
+  latest_version="${release_tag#v}"
+  if ! version_is_newer "${latest_version}" "${APP_VERSION}"; then
+    info "已是最新正式版本：${APP_VERSION}。"
+    return 0
+  fi
+
+  curl -fsSL --proto '=https' --proto-redir '=https' \
+    --retry 3 --connect-timeout 15 --max-time 120 \
+    "${RELEASE_RAW_BASE}/${release_tag}/tcpquality-auto-install.sh" \
+    -o "${temp_dir}/installer.sh" \
+    || die "下载 ${release_tag} 失败；现有版本保持不变。"
+  downloaded_version="$(source_version "${temp_dir}/installer.sh")"
+  [[ "${downloaded_version}" == "${latest_version}" ]] \
+    || die "下载脚本版本与 Release 标签不一致；现有版本保持不变。"
+  bash -n "${temp_dir}/installer.sh" \
+    || die "下载脚本语法检查失败；现有版本保持不变。"
+
+  backend="$(host_backend)"
+  if [[ "${backend}" == "systemd" ]]; then
+    systemctl is-enabled --quiet "${TIMER_UNIT}" && test_enabled=1 || true
+    systemctl is-active --quiet "${TIMER_UNIT}" && test_active=1 || true
+    systemctl is-enabled --quiet "${UPDATE_TIMER_UNIT}" && update_enabled=1 || true
+    systemctl is-active --quiet "${UPDATE_TIMER_UNIT}" && update_active=1 || true
+  fi
+  mkdir -p "${temp_dir}/backup"
+  for index in "${!paths[@]}"; do
+    file="${paths[index]}"
+    if [[ -f "${file}" ]]; then
+      cp -p "${file}" "${temp_dir}/backup/${index}" \
+        || die "备份当前安装失败；现有版本保持不变。"
+    fi
+  done
+
+  info "检测到正式版本 ${release_tag}，开始升级。"
+  if bash "${temp_dir}/installer.sh" upgrade &&
+    [[ "$(source_version "${MANAGER_PATH}")" == "${latest_version}" ]] &&
+    grep -Fqx "RUNNER_VERSION=\"${latest_version}\"" "${RUNNER}"; then
+    ok "自动更新完成：${APP_VERSION} → ${latest_version}。"
+    return 0
+  fi
+  rc=$?
+  (( rc != 0 )) || rc=1
+  err "升级未完成，恢复更新前的脚本和调度文件。"
+  for index in "${!paths[@]}"; do
+    file="${paths[index]}"
+    if [[ -f "${temp_dir}/backup/${index}" ]]; then
+      cp -p "${temp_dir}/backup/${index}" "${file}" || true
+    else
+      rm -f "${file}" || true
+    fi
+  done
+  if [[ "${backend}" == "systemd" ]]; then
+    systemctl daemon-reload || true
+    if [[ "${test_enabled}" -eq 1 ]]; then systemctl enable "${TIMER_UNIT}" >/dev/null 2>&1 || true; else systemctl disable "${TIMER_UNIT}" >/dev/null 2>&1 || true; fi
+    if [[ "${test_active}" -eq 1 ]]; then systemctl start "${TIMER_UNIT}" >/dev/null 2>&1 || true; else systemctl stop "${TIMER_UNIT}" >/dev/null 2>&1 || true; fi
+    if [[ "${update_enabled}" -eq 1 ]]; then systemctl enable "${UPDATE_TIMER_UNIT}" >/dev/null 2>&1 || true; else systemctl disable "${UPDATE_TIMER_UNIT}" >/dev/null 2>&1 || true; fi
+    if [[ "${update_active}" -eq 1 ]]; then systemctl start "${UPDATE_TIMER_UNIT}" >/dev/null 2>&1 || true; else systemctl stop "${UPDATE_TIMER_UNIT}" >/dev/null 2>&1 || true; fi
+  fi
+  return "${rc}"
+)
+
 start_app() {
   need_root "start" "$@"
   require_installed
@@ -1645,6 +1817,7 @@ start_app() {
   case "$(host_backend)" in
     systemd)
       systemctl enable --now "${TIMER_UNIT}" >/dev/null
+      sync_update_timer
       ;;
     cron)
       load_config
@@ -1668,6 +1841,7 @@ stop_app() {
   case "$(host_backend)" in
     systemd)
       systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
+      sync_update_timer
       ;;
     cron)
       rm -f "${CRON_FILE}"
@@ -1690,6 +1864,7 @@ restart_app() {
     systemd)
       systemctl enable "${TIMER_UNIT}" >/dev/null 2>&1 || true
       systemctl restart "${TIMER_UNIT}" >/dev/null
+      sync_update_timer
       ;;
     cron)
       load_config
@@ -1797,7 +1972,13 @@ show_status() {
   local timer_active_text="否"
   local running_text="否"
   local runner_version=""
+  local auto_update_status="否"
   runner_version="$(sed -nE 's/^RUNNER_VERSION="([^"]+)"$/\1/p' "${RUNNER}" | head -n 1 || true)"
+
+  case "$(host_backend)" in
+    systemd) systemctl is-enabled --quiet "${UPDATE_TIMER_UNIT}" 2>/dev/null && auto_update_status="是" || true ;;
+    cron) grep -Fq "${MANAGER_PATH} auto-update" "${CRON_FILE}" 2>/dev/null && auto_update_status="是" || true ;;
+  esac
 
   scheduler_enabled && timer_enabled="是" || true
   scheduler_active && timer_active_text="是" || true
@@ -1830,6 +2011,7 @@ show_status() {
   printf '%-18s %s\n' "定时任务启用：" "${timer_enabled}"
   printf '%-18s %s\n' "调度器运行中：" "${timer_active_text}"
   printf '%-18s %s\n' "测试正在运行：" "${running_text}"
+  printf '%-18s %s\n' "自动更新启用：" "${auto_update_status}"
 
   local mem_kb swap_kb
   mem_kb="$(memory_total_kb)"
@@ -1912,7 +2094,9 @@ uninstall_app() {
     case "$(host_backend)" in
       systemd)
         systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
+        systemctl disable --now "${UPDATE_TIMER_UNIT}" >/dev/null 2>&1 || true
         systemctl stop "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+        systemctl stop "${UPDATE_SERVICE_UNIT}" >/dev/null 2>&1 || true
         ;;
       cron)
         rm -f "${CRON_FILE}"
@@ -1922,7 +2106,7 @@ uninstall_app() {
     stop_running_test
   fi
 
-  rm -f "${RUNNER}" "${MANAGER_PATH}" "${CONF_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}" "${CRON_FILE}"
+  rm -f "${RUNNER}" "${MANAGER_PATH}" "${CONF_FILE}" "${SERVICE_FILE}" "${TIMER_FILE}" "${UPDATE_SERVICE_FILE}" "${UPDATE_TIMER_FILE}" "${CRON_FILE}"
   rm -rf "${LOG_DIR}"
 
   if [[ "$(host_backend)" == "systemd" ]]; then
@@ -1952,6 +2136,7 @@ show_menu() {
 10) 停止并卸载
 11) 重试历史报告上传
 12) 按现有配置升级脚本
+13) 立即检查正式版本更新
 0) 退出
 EOF
   echo
@@ -1961,7 +2146,7 @@ interactive_menu() {
   local choice=""
   while true; do
     show_menu
-    read -r -p "请选择 [0-12]: " choice
+    read -r -p "请选择 [0-13]: " choice
     case "${choice}" in
       1) install_or_configure "$@"; pause_menu ;;
       2) run_test "$@"; pause_menu ;;
@@ -1982,6 +2167,7 @@ interactive_menu() {
         ;;
       11) retry_reports "$@"; pause_menu ;;
       12) upgrade_app "$@"; pause_menu ;;
+      13) auto_update_app "$@"; pause_menu ;;
       0) exit 0 ;;
       *) warn "无效选项，请重新输入。"; sleep 1 ;;
     esac
@@ -1997,6 +2183,7 @@ TcpQuality Auto ${APP_VERSION}
   sudo ${APP_NAME}                 进入交互式菜单
   sudo ${APP_NAME} install         安装 / 更新
   sudo ${APP_NAME} upgrade         按现有配置升级（需先下载新版脚本）
+  sudo ${APP_NAME} auto-update     检查并安装最新正式 Release
   sudo ${APP_NAME} config          修改配置
   sudo ${APP_NAME} run             立即执行一次测试
   sudo ${APP_NAME} retry           重试历史报告上传
@@ -2021,6 +2208,10 @@ main() {
     upgrade)
       shift || true
       upgrade_app "$@"
+      ;;
+    auto-update|check-updates)
+      shift || true
+      auto_update_app "$@"
       ;;
     config)
       shift || true

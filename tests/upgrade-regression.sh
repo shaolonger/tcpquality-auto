@@ -15,6 +15,8 @@ RUNNER="${test_dir}/runner"
 MANAGER_PATH="${test_dir}/installed-manager"
 SERVICE_FILE="${test_dir}/tcpquality-auto.service"
 TIMER_FILE="${test_dir}/tcpquality-auto.timer"
+UPDATE_SERVICE_FILE="${test_dir}/tcpquality-auto-update.service"
+UPDATE_TIMER_FILE="${test_dir}/tcpquality-auto-update.timer"
 CRON_FILE="${test_dir}/tcpquality-auto.cron"
 LOG_DIR="${test_dir}/logs"
 SCRIPT_SELF="${repo_dir}/tcpquality-auto-install.sh"
@@ -53,15 +55,29 @@ scheduler_enabled() { return 0; }
 
 upgrade_app
 test "$(sha256sum "${CONF_FILE}")" = "${before}"
-grep -q '^RUNNER_VERSION="2026.10.11.2"$' "${RUNNER}"
+grep -q '^RUNNER_VERSION="2026.10.11.3"$' "${RUNNER}"
 grep -q '^TimeoutStartSec=3h$' "${SERVICE_FILE}"
 grep -q 'restart tcpquality-auto.timer' "${test_dir}/systemctl-calls"
+grep -q 'enable --now tcpquality-auto-update.timer' "${test_dir}/systemctl-calls"
+grep -q '^OnCalendar=\*-\*-\* 03:15:00 UTC$' "${UPDATE_TIMER_FILE}"
+grep -q '^ExecStart=.* auto-update$' "${UPDATE_SERVICE_FILE}"
+
+printf 'AUTO_UPDATE=N\n' >> "${CONF_FILE}"
+before="$(sha256sum "${CONF_FILE}")"
+: > "${test_dir}/systemctl-calls"
+upgrade_app
+test "$(sha256sum "${CONF_FILE}")" = "${before}"
+grep -q 'restart tcpquality-auto.timer' "${test_dir}/systemctl-calls"
+grep -q 'disable --now tcpquality-auto-update.timer' "${test_dir}/systemctl-calls"
+sed -i '/^AUTO_UPDATE=/d' "${CONF_FILE}"
+before="$(sha256sum "${CONF_FILE}")"
 
 scheduler_enabled() { return 1; }
 : > "${test_dir}/systemctl-calls"
 upgrade_app
 test "$(sha256sum "${CONF_FILE}")" = "${before}"
 grep -q 'disable --now tcpquality-auto.timer' "${test_dir}/systemctl-calls"
+grep -q 'disable --now tcpquality-auto-update.timer' "${test_dir}/systemctl-calls"
 
 # The earliest installer had a runner and timer but no global manager command.
 rm -f "${MANAGER_PATH}"
@@ -71,7 +87,7 @@ scheduler_enabled() { return 0; }
 upgrade_app
 test -x "${MANAGER_PATH}"
 test "$(sha256sum "${CONF_FILE}")" = "${before}"
-grep -q '^RUNNER_VERSION="2026.10.11.2"$' "${RUNNER}"
+grep -q '^RUNNER_VERSION="2026.10.11.3"$' "${RUNNER}"
 
 host_backend() { printf 'cron'; }
 ensure_crond_running() { :; }
@@ -79,6 +95,16 @@ scheduler_enabled() { return 0; }
 upgrade_app
 test "$(sha256sum "${CONF_FILE}")" = "${before}"
 grep -q '^30 20 \* \* \* root ' "${CRON_FILE}"
+grep -q 'auto-update >>' "${CRON_FILE}"
+
+printf 'AUTO_UPDATE=N\n' >> "${CONF_FILE}"
+before="$(sha256sum "${CONF_FILE}")"
+upgrade_app
+test "$(sha256sum "${CONF_FILE}")" = "${before}"
+if grep -q 'auto-update >>' "${CRON_FILE}"; then
+  echo 'disabled auto-update was still scheduled' >&2
+  exit 1
+fi
 
 scheduler_enabled() { return 1; }
 upgrade_app

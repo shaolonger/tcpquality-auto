@@ -97,7 +97,7 @@ pending=("${test_dir}"/logs/*.artifacts/pending-upload)
 test -f "${pending[0]}"
 grep -q 'CSV 已保留' "${test_dir}/telegram"
 grep -q '测试部分完成' "${test_dir}/telegram"
-grep -q '自动脚本版本：2026.10.11.2' "${test_dir}/telegram"
+grep -q '自动脚本版本：2026.10.11.3' "${test_dir}/telegram"
 grep -q '在线报告不可用，附本次原始 CSV' "${test_dir}/telegram"
 if grep -Fq 'tcpquality.ibsgss.uk/rootfs/' "${test_dir}/telegram"; then
   echo 'rootfs URL was reported as a result' >&2
