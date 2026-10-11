@@ -53,7 +53,7 @@ scheduler_enabled() { return 0; }
 
 upgrade_app
 test "$(sha256sum "${CONF_FILE}")" = "${before}"
-grep -q '^RUNNER_VERSION="2026.10.11.1"$' "${RUNNER}"
+grep -q '^RUNNER_VERSION="2026.10.11.2"$' "${RUNNER}"
 grep -q '^TimeoutStartSec=3h$' "${SERVICE_FILE}"
 grep -q 'restart tcpquality-auto.timer' "${test_dir}/systemctl-calls"
 
@@ -71,7 +71,7 @@ scheduler_enabled() { return 0; }
 upgrade_app
 test -x "${MANAGER_PATH}"
 test "$(sha256sum "${CONF_FILE}")" = "${before}"
-grep -q '^RUNNER_VERSION="2026.10.11.1"$' "${RUNNER}"
+grep -q '^RUNNER_VERSION="2026.10.11.2"$' "${RUNNER}"
 
 host_backend() { printf 'cron'; }
 ensure_crond_running() { :; }

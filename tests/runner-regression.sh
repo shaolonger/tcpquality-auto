@@ -97,7 +97,7 @@ pending=("${test_dir}"/logs/*.artifacts/pending-upload)
 test -f "${pending[0]}"
 grep -q 'CSV 已保留' "${test_dir}/telegram"
 grep -q '测试部分完成' "${test_dir}/telegram"
-grep -q '自动脚本版本：2026.10.11.1' "${test_dir}/telegram"
+grep -q '自动脚本版本：2026.10.11.2' "${test_dir}/telegram"
 grep -q '在线报告不可用，附本次原始 CSV' "${test_dir}/telegram"
 if grep -Fq 'tcpquality.ibsgss.uk/rootfs/' "${test_dir}/telegram"; then
   echo 'rootfs URL was reported as a result' >&2
@@ -127,6 +127,18 @@ printf '报告时间：2026-09-20 20:30:00 CST（北京时间）\nSVG 报告上�
   > "${test_dir}/logs/20260920-203000.log"
 bash "${test_dir}/runner" retry
 test -f "${legacy_dir}/uploaded-url"
+
+for day in 17 18 19; do
+  batch_dir="${test_dir}/logs/202609${day}-203000.artifacts"
+  mkdir -p "${batch_dir}"
+  printf '网络,IP版本\n三网,IPv4\n' > "${batch_dir}/zstatic_nping_${day}.csv"
+  printf '2026-09-%s 20:30:00 CST\n' "${day}" > "${batch_dir}/pending-upload"
+done
+bash "${test_dir}/runner" retry
+for day in 17 18 19; do
+  test -f "${test_dir}/logs/202609${day}-203000.artifacts/uploaded-url"
+  test ! -f "${test_dir}/logs/202609${day}-203000.artifacts/pending-upload"
+done
 
 sleep 1
 before_success="$(grep -c 'TcpQuality 测试完成' "${test_dir}/telegram" || true)"
@@ -178,5 +190,15 @@ if bash "${test_dir}/runner"; then
   exit 1
 fi
 grep -q '测试超时或被超时控制器终止（1s）' "${test_dir}/telegram"
+
+missing_dir="${test_dir}/logs/20260916-203000.artifacts"
+mkdir -p "${missing_dir}"
+printf '2026-09-16 20:30:00 CST\n' > "${missing_dir}/pending-upload"
+if bash "${test_dir}/runner" retry; then
+  echo 'pending report without CSV unexpectedly returned success' >&2
+  exit 1
+fi
+test -f "${missing_dir}/pending-upload"
+grep -ql '没有 CSV；待补传标记已保留' "${test_dir}"/logs/*.log
 
 echo 'runner regression checks passed'

@@ -4,11 +4,11 @@ set -Eeuo pipefail
 # ============================================================
 # TcpQuality Auto
 # Pure Bash / Low-overhead / Debian+Alpine
-# Version: 2026.10.11.1
+# Version: 2026.10.11.2
 # ============================================================
 
 APP_NAME="tcpquality-auto"
-APP_VERSION="2026.10.11.1"
+APP_VERSION="2026.10.11.2"
 
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}"
 CONF_FILE="/etc/${APP_NAME}.conf"
@@ -652,7 +652,7 @@ write_runner() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-RUNNER_VERSION="2026.10.11.1"
+RUNNER_VERSION="2026.10.11.2"
 CONF_FILE="/etc/tcpquality-auto.conf"
 LOG_DIR="/var/log/tcpquality-auto"
 
@@ -974,8 +974,10 @@ recover_report_upload() {
 }
 
 retry_pending_reports() {
-  local marker directory csv original_time run_id processed=0
+  local marker directory csv original_time run_id processed=0 limit=2
   local -a markers=() directories=()
+
+  [[ "${1:-}" == "retry" ]] && limit=10
 
   shopt -s nullglob
   directories=("${LOG_DIR}"/*.artifacts)
@@ -996,13 +998,12 @@ retry_pending_reports() {
   shopt -u nullglob
 
   for marker in "${markers[@]}"; do
-    # 每轮最多补传两个旧报告，避免服务不可用时拖慢当天的测试。
-    (( processed < 2 )) || break
+    # 定时任务限制为两份，手动 retry 可一次处理更多积压报告。
+    (( processed < limit )) || break
     directory="${marker%/pending-upload}"
     csv="$(find_report_csv "${directory}")"
     if [[ -z "${csv}" ]]; then
-      echo "[tcpquality-auto] 历史报告补传跳过：${directory} 中没有 CSV。" >> "${raw_log}"
-      rm -f "${marker}"
+      echo "[tcpquality-auto] 历史报告补传失败：${directory} 中没有 CSV；待补传标记已保留，需要检查原始测试日志。" >> "${raw_log}"
       continue
     fi
 
@@ -1082,7 +1083,7 @@ start_time="$(now_local)"
 : > "${raw_log}"
 echo "[tcpquality-auto] Runner 版本：${RUNNER_VERSION}" >> "${raw_log}"
 
-retry_pending_reports
+retry_pending_reports "${1:-}"
 if [[ "${1:-}" == "retry" ]]; then
   sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw_log}" \
     | tr '\r' '\n' > "${clean_log}" || cp -f "${raw_log}" "${clean_log}"
