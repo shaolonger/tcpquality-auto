@@ -4,11 +4,11 @@ set -Eeuo pipefail
 # ============================================================
 # TcpQuality Auto
 # Pure Bash / Low-overhead / Debian+Alpine
-# Version: 2026.09.29.1
+# Version: 2026.10.11.1
 # ============================================================
 
 APP_NAME="tcpquality-auto"
-APP_VERSION="2026.09.29.1"
+APP_VERSION="2026.10.11.1"
 
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}"
 CONF_FILE="/etc/${APP_NAME}.conf"
@@ -652,6 +652,7 @@ write_runner() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+RUNNER_VERSION="2026.10.11.1"
 CONF_FILE="/etc/tcpquality-auto.conf"
 LOG_DIR="/var/log/tcpquality-auto"
 
@@ -759,7 +760,9 @@ if [[ "${ACTIVE_PROFILE}" == "LOWMEM" ]]; then
 fi
 
 send_message() {
-  local text="$1"
+  local text="${1}
+
+自动脚本版本：${RUNNER_VERSION}"
   local -a args=(
     --silent
     --show-error
@@ -865,8 +868,18 @@ find_report_csv() {
 extract_report_time() {
   grep -E '报告时间：' "${clean_log}" 2>/dev/null \
     | tail -n 1 \
-    | sed -E 's/.*报告时间：[[:space:]]*//; s/[[:space:]]*$//' \
+    | sed -E 's/.*报告时间：[[:space:]]*//; s/[（(].*$//; s/[[:space:]]*$//' \
     || true
+}
+
+normalize_report_time() {
+  local value="$1"
+  value="${value%%（*}"
+  value="${value%%(*}"
+  value="$(printf '%s' "${value}" | sed -E 's/[[:space:]]+$//')"
+  [[ "${value}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]CST$ ]] \
+    || return 1
+  printf '%s' "${value}"
 }
 
 RECOVERED_REPORT_URL=""
@@ -886,8 +899,11 @@ recover_report_upload() {
     return 1
   }
 
+  report_time="$(normalize_report_time "${report_time}" || true)"
   if [[ -n "${report_time}" ]]; then
     report_headers+=(-H "X-Report-Time: ${report_time}")
+  else
+    echo "[tcpquality-auto] 警告：报告时间不可解析，本次补传未发送 X-Report-Time。" >> "${raw_log}"
   fi
 
   response_file="$(mktemp "${TMPDIR:-/tmp}/tcpquality-auto-report-response.XXXXXX")"
@@ -938,6 +954,13 @@ recover_report_upload() {
         fi
       } >> "${raw_log}"
 
+      # 同一 CSV 与请求头收到确定的客户端拒绝时，换协议栈重复上传不会改变结果。
+      if [[ "${http_code}" =~ ^4[0-9][0-9]$ && "${http_code}" != "408" && "${http_code}" != "429" ]]; then
+        echo "[tcpquality-auto] HTTP ${http_code} 为请求拒绝；保留 CSV，停止本轮重复上传。" >> "${raw_log}"
+        rm -f "${response_file}" "${curl_err}"
+        return 1
+      fi
+
       if (( attempt < attempts )); then
         sleep_s=$((5 * (1 << (attempt - 1))))
         (( sleep_s > 40 )) && sleep_s=40
@@ -965,7 +988,7 @@ retry_pending_reports() {
       "${LOG_DIR}/${run_id}.log" 2>/dev/null; then
       grep -E '报告时间：' "${LOG_DIR}/${run_id}.log" 2>/dev/null \
         | tail -n 1 \
-        | sed -E 's/.*报告时间：[[:space:]]*//; s/[[:space:]]*$//' \
+        | sed -E 's/.*报告时间：[[:space:]]*//; s/[（(].*$//; s/[[:space:]]*$//' \
         > "${directory}/pending-upload" || true
     fi
   done
@@ -997,6 +1020,28 @@ retry_pending_reports() {
 在线结果：
 ${RECOVERED_REPORT_URL}" \
         || echo "[tcpquality-auto] 历史报告已补传，但 Telegram 通知失败：${run_id}。" >> "${raw_log}"
+    fi
+  done
+}
+
+prune_old_outputs() {
+  local path name run_id
+  local -a paths=()
+
+  shopt -s nullglob
+  paths=("${LOG_DIR}"/*)
+  shopt -u nullglob
+
+  for path in "${paths[@]}"; do
+    name="${path##*/}"
+    if [[ -d "${path}" && "${name}" == *.artifacts ]]; then
+      [[ -f "${path}/pending-upload" ]] && continue
+      find "${path}" -maxdepth 0 -mtime +"${KEEP_DAYS}" -exec rm -rf {} \; 2>/dev/null || true
+    elif [[ -f "${path}" ]]; then
+      run_id="${name%.raw.log}"
+      run_id="${run_id%.log}"
+      [[ -f "${LOG_DIR}/${run_id}.artifacts/pending-upload" ]] && continue
+      find "${path}" -mtime +"${KEEP_DAYS}" -exec rm -f {} \; 2>/dev/null || true
     fi
   done
 }
@@ -1035,6 +1080,7 @@ diagnose_failure() {
 
 start_time="$(now_local)"
 : > "${raw_log}"
+echo "[tcpquality-auto] Runner 版本：${RUNNER_VERSION}" >> "${raw_log}"
 
 retry_pending_reports
 if [[ "${1:-}" == "retry" ]]; then
@@ -1202,7 +1248,8 @@ ${report_url}"
 
 elif [[ "${exit_code}" -eq 0 ]]; then
   status="partial"
-  return_code=0
+  # A completed test without a usable report is not a successful scheduled run.
+  return_code=3
 
   if [[ "${report_upload_failed}" -eq 1 && "${report_recovery_attempted}" -eq 1 ]]; then
     reason="测试主体已执行结束；上游首次上传失败，宿主机恢复上传也未成功"
@@ -1226,6 +1273,9 @@ elif [[ "${exit_code}" -eq 0 ]]; then
     upload_status="$(grep '恢复上传未成功：' "${clean_log}" | tail -n 1 | sed 's/^.*恢复上传未成功：//' || true)"
     [[ -z "${upload_status}" ]] || msg="${msg}
 补传诊断：${upload_status}"
+    upload_response="$(grep '响应：' "${clean_log}" | tail -n 1 | sed 's/^.*响应：//' | cut -c1-180 || true)"
+    [[ -z "${upload_response}" ]] || msg="${msg}
+服务端响应：${upload_response}"
   fi
   if [[ -f "${artifact_dir}/pending-upload" ]]; then
     msg="${msg}
@@ -1269,6 +1319,10 @@ fi
 push_failed=0
 send_message "${msg}" || push_failed=1
 
+if [[ -f "${artifact_dir}/pending-upload" && -n "${current_csv}" ]]; then
+  send_document "${current_csv}" "⚠️ ${SERVER_NAME} · 在线报告不可用，附本次原始 CSV" || push_failed=1
+fi
+
 if [[ "${SEND_FULL_LOG^^}" == "Y" ]]; then
   sleep 2
   send_document "${clean_log}" "${caption}" || push_failed=1
@@ -1278,8 +1332,7 @@ if [[ "${status}" == "success" ]]; then
   rm -rf "${artifact_dir}" 2>/dev/null || true
 fi
 
-find "${LOG_DIR}" -type f -mtime +"${KEEP_DAYS}" -exec rm -f {} \; 2>/dev/null || true
-find "${LOG_DIR}" -type d -name '*.artifacts' -mtime +"${KEEP_DAYS}" -prune -exec rm -rf {} \; 2>/dev/null || true
+prune_old_outputs
 
 if [[ "${push_failed}" -ne 0 ]]; then
   echo "TcpQuality 状态：${status}；但 Telegram 推送失败。" >&2
@@ -1543,6 +1596,47 @@ install_or_configure() {
   fi
 }
 
+upgrade_app() {
+  need_root "upgrade" "$@"
+  # The first releases installed the runner and timer without a manager command.
+  [[ -f "${CONF_FILE}" && -f "${RUNNER}" ]] \
+    || die "未找到已有配置和 Runner。首次部署请执行 install。"
+  check_os
+  load_config
+  validate_timezone "${SCHEDULE_TZ}" || die "已有配置的时区无效，请使用 config 修正。"
+  validate_time "${RUN_TIME}" || die "已有配置的执行时间无效，请使用 config 修正。"
+  ensure_dependencies
+
+  local was_enabled=0
+  scheduler_enabled && was_enabled=1 || true
+
+  write_runner
+  install_manager_self
+
+  case "$(host_backend)" in
+    systemd)
+      rm -f "${CRON_FILE}"
+      write_systemd_units
+      if [[ "${was_enabled}" -eq 1 ]]; then
+        systemctl enable "${TIMER_UNIT}" >/dev/null
+        systemctl restart "${TIMER_UNIT}" >/dev/null
+      else
+        systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
+      fi
+      ;;
+    cron)
+      rm -f "${SERVICE_FILE}" "${TIMER_FILE}"
+      if [[ "${was_enabled}" -eq 1 ]]; then
+        write_cron_file
+      else
+        rm -f "${CRON_FILE}"
+      fi
+      ;;
+  esac
+
+  ok "已升级到 ${APP_VERSION}，原有配置和定时任务启停状态已保留。"
+}
+
 start_app() {
   need_root "start" "$@"
   require_installed
@@ -1701,6 +1795,8 @@ show_status() {
   local timer_enabled="否"
   local timer_active_text="否"
   local running_text="否"
+  local runner_version=""
+  runner_version="$(sed -nE 's/^RUNNER_VERSION="([^"]+)"$/\1/p' "${RUNNER}" | head -n 1 || true)"
 
   scheduler_enabled && timer_enabled="是" || true
   scheduler_active && timer_active_text="是" || true
@@ -1710,7 +1806,11 @@ show_status() {
   line
   echo -e "${C_BOLD} TcpQuality Auto 状态${C_RESET}"
   line
-  printf '%-18s %s\n' "版本：" "${APP_VERSION}"
+  printf '%-18s %s\n' "管理脚本版本：" "${APP_VERSION}"
+  printf '%-18s %s\n' "Runner 版本：" "${runner_version:-旧版（未标记）}"
+  if [[ "${runner_version}" != "${APP_VERSION}" ]]; then
+    warn "管理脚本与 Runner 版本不一致，请使用新版安装脚本执行 upgrade。"
+  fi
   printf '%-18s %s\n' "服务器：" "${SERVER_NAME:-未知}"
   printf '%-18s %s\n' "执行时间：" "${RUN_TIME:-未知}"
   printf '%-18s %s\n' "任务时区：" "${SCHEDULE_TZ:-未知}"
@@ -1850,6 +1950,7 @@ show_menu() {
 9) 查看下一次执行时间
 10) 停止并卸载
 11) 重试历史报告上传
+12) 按现有配置升级脚本
 0) 退出
 EOF
   echo
@@ -1859,7 +1960,7 @@ interactive_menu() {
   local choice=""
   while true; do
     show_menu
-    read -r -p "请选择 [0-11]: " choice
+    read -r -p "请选择 [0-12]: " choice
     case "${choice}" in
       1) install_or_configure "$@"; pause_menu ;;
       2) run_test "$@"; pause_menu ;;
@@ -1879,6 +1980,7 @@ interactive_menu() {
         pause_menu
         ;;
       11) retry_reports "$@"; pause_menu ;;
+      12) upgrade_app "$@"; pause_menu ;;
       0) exit 0 ;;
       *) warn "无效选项，请重新输入。"; sleep 1 ;;
     esac
@@ -1893,6 +1995,7 @@ TcpQuality Auto ${APP_VERSION}
 用法：
   sudo ${APP_NAME}                 进入交互式菜单
   sudo ${APP_NAME} install         安装 / 更新
+  sudo ${APP_NAME} upgrade         按现有配置升级（需先下载新版脚本）
   sudo ${APP_NAME} config          修改配置
   sudo ${APP_NAME} run             立即执行一次测试
   sudo ${APP_NAME} retry           重试历史报告上传
@@ -1913,6 +2016,10 @@ main() {
     install|update)
       shift || true
       install_or_configure "$@"
+      ;;
+    upgrade)
+      shift || true
+      upgrade_app "$@"
       ;;
     config)
       shift || true

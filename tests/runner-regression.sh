@@ -21,10 +21,17 @@ cat > "${test_dir}/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 output=""
 url=""
+report_time=""
 args=("$@")
 while (( $# )); do
   case "$1" in
     -o) output="$2"; shift 2 ;;
+    -H)
+      case "$2" in
+        'X-Report-Time: '*) report_time="${2#X-Report-Time: }" ;;
+      esac
+      shift 2
+      ;;
     https://*) url="$1"; shift ;;
     *) shift ;;
   esac
@@ -34,15 +41,25 @@ case "$url" in
     cp "${TEST_DIR}/entry" "$output"
     ;;
   https://report.test/generate)
-    if [[ -f "${TEST_DIR}/upload-ok" ]]; then
+    printf 'upload\n' >> "${TEST_DIR}/upload-calls"
+    if [[ -f "${TEST_DIR}/reject-upload" ]]; then
+      printf '%s\n' '{"error":"CSV validation failed"}' > "$output"
+      printf '400'
+    elif [[ -f "${TEST_DIR}/upload-ok" && "${report_time}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]CST$ ]]; then
       printf '%s\n' '{"url":"https://tcpquality.ibsgss.uk/r/regression123"}' > "$output"
       printf '200'
+    elif [[ -f "${TEST_DIR}/upload-ok" ]]; then
+      printf '%s\n' '{"error":"invalid report time"}' > "$output"
+      printf '400'
     else
       printf '%s\n' '{"error":"temporary outage"}' > "$output"
       printf '503'
     fi
     ;;
   https://api.telegram.org/*/sendMessage)
+    printf '%s\n' "${args[*]}" >> "${TEST_DIR}/telegram"
+    ;;
+  https://api.telegram.org/*/sendDocument)
     printf '%s\n' "${args[*]}" >> "${TEST_DIR}/telegram"
     ;;
   *) printf 'Unexpected curl URL: %s\n' "$url" >&2; exit 1 ;;
@@ -63,8 +80,8 @@ EOF
 cat > "${test_dir}/entry" <<'EOF'
 #!/usr/bin/env bash
 printf '网络,IP版本\n三网,IPv4\n' > "${TCPQUALITY_OUTPUT_DIR}/zstatic_nping_test.csv"
-echo '报告时间：2026-09-29 20:30:00 CST'
-echo '正在下载 https://example.test/rootfs.tar.zst'
+echo '报告时间：2026-09-29 20:30:00 CST（北京时间）'
+echo '正在下载 https://tcpquality.ibsgss.uk/rootfs/releases/v1.00039/tcpquality-rootfs-amd64.tar.xz`'
 echo 'SVG 报告上传失败，本地 CSV 已保留'
 EOF
 
@@ -72,11 +89,17 @@ export TEST_DIR="${test_dir}" PATH="${test_dir}/bin:${PATH}"
 export TCPQUALITY_URL=https://entry.test TCPQUALITY_REPORT_API=https://report.test/generate
 export TCPQUALITY_REPORT_RECOVERY_ATTEMPTS=1
 
-bash "${test_dir}/runner"
+if bash "${test_dir}/runner"; then
+  echo 'missing online report unexpectedly returned success' >&2
+  exit 1
+fi
 pending=("${test_dir}"/logs/*.artifacts/pending-upload)
 test -f "${pending[0]}"
 grep -q 'CSV 已保留' "${test_dir}/telegram"
-if grep -q '在线结果：.*rootfs' "${test_dir}/telegram"; then
+grep -q '测试部分完成' "${test_dir}/telegram"
+grep -q '自动脚本版本：2026.10.11.1' "${test_dir}/telegram"
+grep -q '在线报告不可用，附本次原始 CSV' "${test_dir}/telegram"
+if grep -Fq 'tcpquality.ibsgss.uk/rootfs/' "${test_dir}/telegram"; then
   echo 'rootfs URL was reported as a result' >&2
   exit 1
 fi
@@ -100,7 +123,7 @@ grep -q 'https://tcpquality.ibsgss.uk/r/regression123' "${test_dir}/telegram"
 legacy_dir="${test_dir}/logs/20260920-203000.artifacts"
 mkdir -p "${legacy_dir}"
 printf '网络,IP版本\n三网,IPv4\n' > "${legacy_dir}/zstatic_nping_old.csv"
-printf '报告时间：2026-09-20 20:30:00 CST\nSVG 报告上传失败\n' \
+printf '报告时间：2026-09-20 20:30:00 CST（北京时间）\nSVG 报告上传失败\n' \
   > "${test_dir}/logs/20260920-203000.log"
 bash "${test_dir}/runner" retry
 test -f "${legacy_dir}/uploaded-url"
@@ -112,13 +135,36 @@ after_success="$(grep -c 'TcpQuality 测试完成' "${test_dir}/telegram" || tru
 test "$after_success" -gt "$before_success"
 
 sleep 1
+touch "${test_dir}/reject-upload"
+before_calls="$(wc -l < "${test_dir}/upload-calls")"
+if bash "${test_dir}/runner"; then
+  echo 'rejected report unexpectedly returned success' >&2
+  exit 1
+fi
+after_calls="$(wc -l < "${test_dir}/upload-calls")"
+test "$((after_calls - before_calls))" -eq 1
+grep -q '服务端响应：{"error":"CSV validation failed"}' "${test_dir}/telegram"
+pending_400=("${test_dir}"/logs/*.artifacts/pending-upload)
+test "${#pending_400[@]}" -eq 1
+old_dir="${pending_400[0]%/pending-upload}"
+old_log="${old_dir%.artifacts}.log"
+touch -d '30 days ago' "${pending_400[0]}" "${old_dir}"/*.csv "${old_dir}" "${old_log}"
+
 cat > "${test_dir}/entry" <<'EOF'
 #!/usr/bin/env bash
 echo 'SVG 报告上传失败，本地 CSV 未生成'
 EOF
-bash "${test_dir}/runner"
+if TCPQUALITY_KEEP_DAYS=0 bash "${test_dir}/runner"; then
+  echo 'missing CSV unexpectedly returned success' >&2
+  exit 1
+fi
 grep -q '没有可用于恢复上传的本次 CSV' "${test_dir}/telegram"
 grep -q '未找到本次测试持久化 CSV' "$(ls -t "${test_dir}"/logs/*.log | head -n 1)"
+test -f "${pending_400[0]}"
+test -f "${old_log}"
+
+rm -f "${test_dir}/reject-upload"
+bash "${test_dir}/runner" retry
 
 sleep 1
 cat > "${test_dir}/entry" <<'EOF'

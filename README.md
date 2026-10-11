@@ -59,7 +59,9 @@
 - 支持 Telegram Forum / Topic
 - 自动发送测试完成 / 失败摘要
 - 自动尝试提取 TcpQuality 在线结果 URL
-- 上传失败时保留 CSV；后续定时运行自动补传，也支持手动重试
+- 上传失败时保留并通过 Telegram 发送原始 CSV；后续定时运行自动补传，也支持手动重试
+- 测试进程结束但报告不可用时返回非零状态，让 systemd 显示异常
+- Telegram 摘要标明实际 Runner 版本，状态页检查管理脚本与 Runner 是否一致
 - 可选择是否发送完整测试日志附件
 - **完整日志附件默认不发送**
 - 完整日志始终保存在 VPS 本地
@@ -112,6 +114,7 @@ bash <(curl -sL https://raw.githubusercontent.com/shaolonger/tcpquality-auto/mai
 9) 查看下一次执行时间
 10) 停止并卸载
 11) 重试历史报告上传
+12) 按现有配置升级脚本
 0) 退出
 ```
 
@@ -616,6 +619,7 @@ sudo tcpquality-auto
 9) 查看下一次执行时间
 10) 停止并卸载
 11) 重试历史报告上传
+12) 按现有配置升级脚本
 0) 退出
 ```
 
@@ -629,6 +633,7 @@ sudo tcpquality-auto
 |---|---|
 | 打开管理菜单 | `sudo tcpquality-auto` |
 | 安装 / 更新 | `sudo tcpquality-auto install` |
+| 按现有配置升级 | `sudo bash /tmp/tcpquality-auto-install.sh upgrade` |
 | 修改配置 | `sudo tcpquality-auto config` |
 | 查看状态 | `sudo tcpquality-auto status` |
 | 查看日志 | `sudo tcpquality-auto logs` |
@@ -717,7 +722,7 @@ sudo tcpquality-auto run
 3. 尝试附带在线结果 URL；
 4. 如果启用了 `SEND_FULL_LOG=Y`，再发送完整日志附件。
 
-若在线报告暂时无法上传，而上游已生成 CSV，脚本会把 CSV 留在本地。之后的定时运行最多重试两个历史报告；也可手动执行 `sudo tcpquality-auto retry`。补传成功后会再发送一条带在线链接的 Telegram 消息。历史 CSV 与日志按保留天数清理，默认 14 天。若上游未生成 CSV，无法补传，需查看本地日志并重新测试。
+若在线报告暂时无法上传，而上游已生成 CSV，脚本会把 CSV 留在本地并作为 Telegram 附件发送，同时将本次服务标为异常。之后的定时运行最多重试两个历史报告；也可手动执行 `sudo tcpquality-auto retry`。补传成功后会再发送一条带在线链接的 Telegram 消息。HTTP 400 等请求拒绝会记录服务端响应，并停止本轮重复上传。普通历史文件默认保留 14 天；待补传的 CSV 和对应日志会保留至补传成功。若上游未生成 CSV，无法补传，需查看本地日志并重新测试。
 
 ---
 
@@ -1296,21 +1301,16 @@ curl -fsSL \
   -o /tmp/tcpquality-auto-install.sh
 ```
 
-执行：
+已有安装可直接执行以下命令，保留原有配置和定时任务启停状态，无需重新填写 Telegram 参数：
 
 ```bash
-sudo bash /tmp/tcpquality-auto-install.sh
+sudo bash /tmp/tcpquality-auto-install.sh upgrade
+sudo tcpquality-auto status
 ```
 
-然后选择：
+最早期版本没有安装全局 `tcpquality-auto` 命令。如果旧 VPS 提示 `command not found`，只要仍有 `/etc/tcpquality-auto.conf` 和 `/usr/local/sbin/tcpquality-auto-run.sh`，上述 `sudo bash /tmp/tcpquality-auto-install.sh upgrade` 同样可以迁移它。迁移后检查状态中的管理脚本与 Runner 版本是否一致。
 
-```text
-1) 安装 / 更新
-```
-
-已有配置会自动读取。
-
-直接回车即可保留旧值。
+首次安装或需要修改配置时，执行 `sudo bash /tmp/tcpquality-auto-install.sh install`。
 
 更新后：
 
